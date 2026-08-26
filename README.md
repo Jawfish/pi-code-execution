@@ -1,0 +1,132 @@
+# Pi Code Execution
+
+A Pi extension that runs short CPython scripts as the `code_execution` tool.
+It is useful for data transformation, dependent operations, and filtering large
+intermediate results before they enter model context.
+
+## Install
+
+This package supports POSIX systems. Install
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/), then install
+the package:
+
+```bash
+pi install git:github.com/jawfish/pi-code-execution
+```
+
+Pi loads `index.ts` from the package manifest. To try a checkout without
+installing it:
+
+```bash
+pi --no-extensions -e .
+```
+
+## Features
+
+- Runs full CPython in a fresh process for each call.
+- Supports top-level `await`.
+- Resolves relative paths and local imports from the Pi session directory.
+- Installs script dependencies declared with
+  [PEP 723](https://peps.python.org/pep-0723/) through `uv`.
+- Streams output while the script runs and bounds retained stdout and stderr.
+- Applies a configurable deadline to dependency installation, Python, and
+  bridged tool calls.
+- Stores older script sources as verified content-addressed artifacts, then
+  replaces them with compact artifact references in model context.
+- Lets trusted Pi extensions explicitly expose selected tools to Python.
+
+Example with a third-party dependency:
+
+```python
+# /// script
+# dependencies = ["httpx"]
+# ///
+
+import httpx
+
+response = httpx.get("https://example.com")
+print(response.status_code)
+```
+
+Set `PI_CODE_EXECUTION_UV` to use a specific `uv` executable:
+
+```bash
+PI_CODE_EXECUTION_UV=/opt/uv/bin/uv pi
+```
+
+## Tool bridge
+
+No unrelated tools are built in. Another trusted extension can expose one of
+its tool definitions through the shared `code_execution:collect_tools` event.
+The tool must also be active in Pi for the current session.
+
+```typescript
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { CodeExecutionToolCollection } from "@jawfish/pi-code-execution/host";
+
+import { issueSearchTool } from "./issue-search.ts";
+
+export default function (pi: ExtensionAPI): void {
+  pi.registerTool(issueSearchTool);
+  pi.events.on("code_execution:collect_tools", (event) => {
+    (event as CodeExecutionToolCollection).add(issueSearchTool);
+  });
+}
+```
+
+Python receives normalized callable names. `available_tools()` returns their
+signatures:
+
+```python
+print(available_tools())
+result = await search_issues(query="startup failure")
+print(result)
+```
+
+Calls are schema-validated in the Pi process. Bridged tool output is returned
+as text. If a Pi tool stored a larger truncated result, code execution can
+recover up to 5 MiB from that tool's output artifact.
+
+Policy extensions can inspect or block nested calls through the
+`code_execution:tool_call` event. Its mutable event object contains `toolName`,
+`input`, `cwd`, and optional `block` and `reason` fields.
+
+## Security model
+
+`code_execution` is not a sandbox. Generated Python runs with the same user
+permissions as Pi and inherits its environment. It can read and write files,
+start subprocesses, access the network, and install packages. Only install this
+extension and PEP 723 dependencies from sources you trust.
+
+Bridged tools can also have side effects. Cancellation stops waiting for a
+bridged call, but it cannot undo effects that already happened.
+
+Tool dispatch uses an authenticated per-run loopback connection. This prevents
+an unrelated local process from accidentally calling the bridge, but it is not
+a boundary against the Python process itself.
+
+Cancellation uses a POSIX process group and escalates from `SIGTERM` to
+`SIGKILL`. Deliberately detached descendants can escape that group. Windows is
+not supported because Node does not provide equivalent process-tree
+containment without an additional native job-object implementation.
+
+Older sources are stored under Pi's agent directory in `code-execution/`.
+Directories and files use private POSIX modes where supported. Artifacts remain
+until the user removes them, and any process running as the same user may read
+them. Session placeholders contain artifact IDs, not machine-specific absolute
+paths.
+
+## Development
+
+```bash
+bun install
+bun run test
+bun run typecheck
+PI_SKIP_VERSION_CHECK=1 pi --no-extensions -e . --list-models
+```
+
+The test suite requires `uv` and a platform with POSIX process groups.
+
+## License
+
+MIT
