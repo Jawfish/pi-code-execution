@@ -32,7 +32,9 @@ pi --no-extensions -e .
 - Applies a configurable deadline to dependency installation, Python, and
   bridged tool calls.
 - Stores older script sources as verified content-addressed artifacts, then
-  replaces them with compact artifact references in model context.
+  replaces them with structured `sourceRef` values in model context.
+- Replays an exact saved script from its verified `sourceRef`.
+- Reads saved source without execution through `code_execution_source`.
 - Lets trusted Pi extensions explicitly expose selected tools to Python.
 
 Example with a third-party dependency:
@@ -53,6 +55,21 @@ Set `PI_CODE_EXECUTION_UV` to use a specific `uv` executable:
 ```bash
 PI_CODE_EXECUTION_UV=/opt/uv/bin/uv pi
 ```
+
+## Saved source references
+
+The extension keeps the latest script visible to the model. It replaces older
+completed scripts with a structured `sourceRef` after it has saved their source.
+The reference contains a full SHA-256 digest, line count, content-addressed
+artifact ID, and optional original tool-call ID.
+
+The model can pass the `sourceRef` unchanged to `code_execution` to rerun the
+exact verified script. It can call `code_execution_source` first to inspect the
+source without running it. The reader supports `offset` and `limit` for long
+scripts and caps each source chunk at 20 KiB.
+
+Legacy path-bearing and XML-like references remain readable for resumed
+sessions. New references contain no machine-specific absolute path.
 
 ## Tool bridge
 

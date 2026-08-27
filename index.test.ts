@@ -7,9 +7,16 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import { codeArtifactId, codeDigest, loadCodeArtifact, saveCodeArtifact } from "./artifacts.ts";
+import { codeSourceReference } from "./context.ts";
 import { assembleOutput, NO_OUTPUT, truncateOutput } from "./core.ts";
 import type { AnyToolDefinition } from "./host.ts";
-import { createCodeExecutionTool, executeForTest } from "./index.ts";
+import {
+  createCodeExecutionSourceTool,
+  createCodeExecutionTool,
+  executeForTest,
+  readSourceForTest,
+} from "./index.ts";
+import type { CodeExecutionInput } from "./index.ts";
 import { SandboxRunner } from "./runner.ts";
 
 const dirs: string[] = [];
@@ -81,12 +88,14 @@ describe("code_execution tool", () => {
       "Always filter or summarize tool and subprocess output before printing",
     );
     expect(tool.description).toContain("recovered automatically up to 5MB");
-    expect(tool.description).toContain("Never pass a");
+    expect(tool.description).toContain("structured `sourceRef`");
+    expect(tool.description).toContain("Never put a legacy");
     expect(tool.description).not.toContain("Typical pattern:");
     expect(tool.description).toContain("reason in your response text");
     expect(tool.promptGuidelines).toEqual([
       expect.stringContaining("use a direct tool call for one untransformed result"),
       expect.stringContaining("filter or summarize"),
+      expect.stringContaining("sourceRef unchanged"),
     ]);
     void runner.close();
   });
@@ -184,6 +193,48 @@ describe("code_execution tool", () => {
         expect(input.code).toBe(source);
       }
       expect(saveCalls).toBe(0);
+    } finally {
+      await runner.close();
+    }
+  });
+
+  test("replays a structured sourceRef as exact verified source", async () => {
+    const dir = await tempDir();
+    const runner = new SandboxRunner();
+    const source = "print('structured-reference')";
+    await saveCodeArtifact(source, dir);
+    const input: CodeExecutionInput = { sourceRef: codeSourceReference(source, "original") };
+    try {
+      const tool = createCodeExecutionTool(
+        runner,
+        undefined,
+        undefined,
+        (reference) => loadCodeArtifact(reference, dir),
+      );
+      const result = await executeForTest(tool, input, { cwd: dir } as ExtensionContext);
+      const [text] = result.content;
+      expect(text?.type === "text" && text.text).toBe("structured-reference");
+      expect(input.code).toBe(source);
+      expect(input.sourceRef).toBeUndefined();
+    } finally {
+      await runner.close();
+    }
+  });
+
+  test("requires exactly one inline source or sourceRef", async () => {
+    const dir = await tempDir();
+    const runner = new SandboxRunner();
+    const tool = createCodeExecutionTool(runner, saveTestArtifact);
+    const sourceRef = codeSourceReference("print('old')");
+    try {
+      await expect(
+        executeForTest(tool, {}, { cwd: dir } as ExtensionContext),
+      ).rejects.toThrow(/exactly one/iu);
+      await expect(
+        executeForTest(tool, { code: "print('new')", sourceRef }, {
+          cwd: dir,
+        } as ExtensionContext),
+      ).rejects.toThrow(/exactly one/iu);
     } finally {
       await runner.close();
     }
@@ -371,5 +422,81 @@ describe("code_execution tool", () => {
     } finally {
       await runner.close();
     }
+  });
+});
+
+describe("code_execution_source tool", () => {
+  test("reads verified saved source without executing it", async () => {
+    const dir = await tempDir();
+    const source = "raise RuntimeError('must not run')\r\nprint('second')";
+    await saveCodeArtifact(source, dir);
+    const tool = createCodeExecutionSourceTool(
+      (code) => saveCodeArtifact(code, dir),
+      (reference) => loadCodeArtifact(reference, dir),
+    );
+    const result = await readSourceForTest(
+      tool,
+      { sourceRef: codeSourceReference(source) },
+      { cwd: dir } as ExtensionContext,
+    );
+    expect(result.content[0]).toEqual({ text: source, type: "text" });
+    expect(result.details?.source).toBe(source);
+  });
+
+  test("reads saved source in exact UTF-8 byte ranges", async () => {
+    const dir = await tempDir();
+    const source = "abcéd";
+    await saveCodeArtifact(source, dir);
+    const tool = createCodeExecutionSourceTool(
+      (code) => saveCodeArtifact(code, dir),
+      (reference) => loadCodeArtifact(reference, dir),
+    );
+    const sourceRef = codeSourceReference(source);
+    const first = await readSourceForTest(
+      tool,
+      { limit: 4, sourceRef },
+      { cwd: dir } as ExtensionContext,
+    );
+    expect(first.content).toEqual([
+      { text: "abc", type: "text" },
+      { text: "Source continues at byte offset 3 of 6", type: "text" },
+    ]);
+    expect(first.details?.nextOffset).toBe(3);
+
+    const second = await readSourceForTest(
+      tool,
+      { offset: first.details?.nextOffset, sourceRef },
+      { cwd: dir } as ExtensionContext,
+    );
+    expect(second.content[0]).toEqual({ text: "éd", type: "text" });
+
+    await expect(
+      readSourceForTest(tool, { offset: 4, sourceRef }, {
+        cwd: dir,
+      } as ExtensionContext),
+    ).rejects.toThrow(/inside a UTF-8 character/iu);
+    await expect(
+      readSourceForTest(tool, { limit: 3, sourceRef }, {
+        cwd: dir,
+      } as ExtensionContext),
+    ).rejects.toThrow(/at least 4 UTF-8 bytes/iu);
+  });
+
+  test("reports a missing saved source once", async () => {
+    const dir = await tempDir();
+    const sourceRef = {
+      artifactId: `${"0".repeat(64)}.py`,
+      lines: 1,
+      sha256: "0".repeat(64),
+    };
+    const tool = createCodeExecutionSourceTool(undefined, (reference) =>
+      loadCodeArtifact(reference, dir),
+    );
+    const result = await readSourceForTest(tool, { sourceRef }, {
+      cwd: dir,
+      sessionManager: { getEntries: () => [] },
+    } as unknown as ExtensionContext);
+    const [text] = result.content;
+    expect(text?.type === "text" && text.text).toContain("Do not retry");
   });
 });

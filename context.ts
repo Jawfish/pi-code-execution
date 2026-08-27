@@ -5,10 +5,22 @@ import type { CodeArtifactReference } from "./artifacts.ts";
 
 type ContextMessages = ContextEvent["messages"];
 
+export const codeSourceReference = (
+  code: string,
+  toolCallId?: string,
+): CodeArtifactReference => ({
+  artifactId: codeArtifactId(code),
+  lines: code.split(/\r?\n/u).length,
+  sha256: codeDigest(code),
+  ...(toolCallId ? { toolCallId } : {}),
+});
+
 export const codePlaceholder = (code: string, toolCallId?: string): string => {
-  const lines = code.split(/\r?\n/u).length;
-  const call = toolCallId ? ` tool_call_id="${encodeURIComponent(toolCallId)}"` : "";
-  return `<code_execution_source_redacted artifact="${codeArtifactId(code)}"${call} lines="${lines}" sha256="${codeDigest(code)}">`;
+  const reference = codeSourceReference(code, toolCallId);
+  const call = reference.toolCallId
+    ? ` tool_call_id="${encodeURIComponent(reference.toolCallId)}"`
+    : "";
+  return `<code_execution_source_redacted artifact="${reference.artifactId}"${call} lines="${reference.lines}" sha256="${reference.sha256}">`;
 };
 
 const CURRENT_PLACEHOLDER =
@@ -107,18 +119,34 @@ export const redactCompletedCodeExecutions = (messages: ContextMessages): Contex
           if (
             block.type !== "toolCall" ||
             block.name !== "code_execution" ||
-            !completedIds.has(block.id) ||
-            block.id === latestCodeCallId ||
-            typeof block.arguments.code !== "string" ||
-            isRedactedCodePlaceholder(block.arguments.code)
+            typeof block.arguments.code !== "string"
           ) {
             return block;
           }
+          const existingReference = parseCodeArtifactReference(block.arguments.code);
+          if (
+            !existingReference &&
+            (!completedIds.has(block.id) ||
+              block.id === latestCodeCallId ||
+              isRedactedCodePlaceholder(block.arguments.code))
+          ) {
+            return block;
+          }
+          const {
+            code,
+            sourceRef: _sourceRef,
+            ...argumentsWithoutSource
+          } = block.arguments;
           return {
             ...block,
             arguments: {
-              ...block.arguments,
-              code: codePlaceholder(block.arguments.code, block.id),
+              ...argumentsWithoutSource,
+              sourceRef: existingReference
+                ? {
+                    ...existingReference,
+                    ...(existingReference.toolCallId ? {} : { toolCallId: block.id }),
+                  }
+                : codeSourceReference(code, block.id),
             },
           };
         }),

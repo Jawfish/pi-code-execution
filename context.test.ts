@@ -4,6 +4,7 @@ import type { ContextEvent } from "@earendil-works/pi-coding-agent";
 
 import {
   codePlaceholder,
+  codeSourceReference,
   isRedactedCodePlaceholder,
   parseCodeArtifactReference,
   redactCompletedCodeExecutions,
@@ -32,7 +33,10 @@ const result = (id: string, details?: unknown) => ({
   toolName: "code_execution",
 });
 
-const codeAt = (context: ContextMessages, messageIndex: number): string => {
+const argumentsAt = (
+  context: ContextMessages,
+  messageIndex: number,
+): Record<string, unknown> => {
   const message = context[messageIndex];
   if (message?.role !== "assistant") {
     throw new Error("expected assistant message");
@@ -41,8 +45,11 @@ const codeAt = (context: ContextMessages, messageIndex: number): string => {
   if (block?.type !== "toolCall") {
     throw new Error("expected tool call");
   }
-  return String(block.arguments.code);
+  return block.arguments;
 };
+
+const codeAt = (context: ContextMessages, messageIndex: number): string =>
+  String(argumentsAt(context, messageIndex).code);
 
 describe("code execution context redaction", () => {
   test("keeps the latest script and redacts older completed scripts", () => {
@@ -59,9 +66,9 @@ describe("code execution context redaction", () => {
 
     const redacted = redactCompletedCodeExecutions(original);
 
-    expect(codeAt(redacted, 0)).toMatch(
-      /^<code_execution_source_redacted artifact="[a-f\d]{64}\.py" tool_call_id="old" lines="2" sha256="[a-f\d]{64}">$/u,
-    );
+    expect(argumentsAt(redacted, 0)).toEqual({
+      sourceRef: codeSourceReference("print('old')\n2 + 2", "old"),
+    });
     expect(codeAt(redacted, 2)).toBe("print('latest')");
     expect(codeAt(original, 0)).toBe("print('old')\n2 + 2");
     expect(redacted[1]?.role === "toolResult" && redacted[1].details).toEqual({
@@ -121,7 +128,7 @@ describe("code execution context redaction", () => {
     expect(isRedactedCodePlaceholder(`${current}\nprint('new')`)).toBeFalse();
   });
 
-  test("does not recursively redact an existing placeholder", () => {
+  test("converts an existing placeholder to a structured source reference", () => {
     const placeholder = codePlaceholder("print('old')");
     const input = messages([
       assistant(toolCall("old", "code_execution", placeholder)),
@@ -129,18 +136,42 @@ describe("code execution context redaction", () => {
       assistant(toolCall("latest", "code_execution", "print('latest')")),
       result("latest"),
     ]);
-    expect(codeAt(redactCompletedCodeExecutions(input), 0)).toBe(placeholder);
+    expect(argumentsAt(redactCompletedCodeExecutions(input), 0)).toEqual({
+      sourceRef: codeSourceReference("print('old')", "old"),
+    });
   });
 
-  test("uses a stable placeholder", () => {
+  test("converts a legacy digest prefix to a compatible sourceRef", () => {
+    const legacy =
+      "# previous code_execution source saved to /old/machine/0123456789abcdef.py (1 lines, sha256:0123456789ab)";
+    const input = messages([
+      assistant(toolCall("old", "code_execution", legacy)),
+      result("old"),
+      assistant(toolCall("latest", "code_execution", "print('latest')")),
+      result("latest"),
+    ]);
+    expect(argumentsAt(redactCompletedCodeExecutions(input), 0)).toEqual({
+      sourceRef: {
+        artifactId: "0123456789abcdef.py",
+        lines: 1,
+        sha256: "0123456789ab",
+        toolCallId: "old",
+      },
+    });
+  });
+
+  test("uses a stable structured source reference", () => {
     const input = messages([
       assistant(toolCall("first", "code_execution", "print('same')")),
       result("first"),
       assistant(toolCall("latest", "code_execution", "print('latest')")),
       result("latest"),
     ]);
-    expect(codeAt(redactCompletedCodeExecutions(input), 0)).toBe(
-      codeAt(redactCompletedCodeExecutions(input), 0),
+    expect(argumentsAt(redactCompletedCodeExecutions(input), 0)).toEqual(
+      argumentsAt(redactCompletedCodeExecutions(input), 0),
+    );
+    expect(JSON.stringify(argumentsAt(redactCompletedCodeExecutions(input), 0))).not.toContain(
+      "/home/",
     );
   });
 });
