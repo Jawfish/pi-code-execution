@@ -48,6 +48,7 @@ export interface SpooledOutputStream {
 
 export interface OutputSpool {
   retainedBytes: number;
+  retentionLimitBytes: number;
   retentionTruncated: boolean;
   stderr: SpooledOutputStream;
   stdout: SpooledOutputStream;
@@ -881,6 +882,7 @@ export class SandboxRunner {
         ) {
           await options.outputSpoolConsumer({
             retainedBytes: retainedOutputBytes,
+            retentionLimitBytes: maxRetainedOutputBytes,
             retentionTruncated: outputRetentionTruncated,
             stderr: {
               emittedBytes: stderrBytes,
