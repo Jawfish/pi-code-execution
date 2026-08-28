@@ -351,6 +351,52 @@ describe("createHostFunctions", () => {
     expect(afterCall.parentToolCallId).toBe("outer-cancel");
   });
 
+  test("runs legacy policy before lifecycle hooks and supports a dispatcher adapter", async () => {
+    const order: string[] = [];
+    const search = definition("Kagi/search");
+    search.execute = (() => {
+      throw new Error("direct execution must not run");
+    }) as AnyToolDefinition["execute"];
+    const [registration] = createPythonRegistrations([
+      {
+        after: (call) => {
+          order.push(`after:${call.status}`);
+        },
+        before: (call) => {
+          order.push(`before:${call.registeredName}`);
+        },
+        definition: search,
+        dispatch: (call, dispatchedDefinition, dispatchedContext) => {
+          order.push(`dispatch:${call.registeredName}`);
+          expect(dispatchedDefinition).toBe(search);
+          expect(dispatchedContext).toBe(ctx);
+          return Promise.resolve({
+            content: [{ text: "adapted", type: "text" }],
+            details: {},
+          });
+        },
+      },
+    ]);
+    if (!registration) throw new Error("expected registration");
+    const hosts = createHostFunctions(
+      [registration],
+      ctx,
+      undefined,
+      (call) => {
+        order.push(`legacy:${call.toolName}`);
+      },
+      { parentToolCallId: "outer-adapter" },
+    );
+
+    expect(await hosts.Kagi_search?.({ query: "x" })).toBe("adapted");
+    expect(order).toEqual([
+      "legacy:Kagi/search",
+      "before:Kagi/search",
+      "dispatch:Kagi/search",
+      "after:success",
+    ]);
+  });
+
   test("runs the preflight hook and lets it block the call", async () => {
     const seen: string[] = [];
     const hosts = createHostFunctions([definition("search")], ctx, undefined, (call) => {

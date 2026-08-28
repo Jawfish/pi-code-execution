@@ -70,6 +70,11 @@ export interface NestedToolUsage {
   totalTokens: number;
 }
 
+export interface NestedToolCallStartRecord extends NestedToolCallIdentity {
+  inputPreview: NestedToolCallPreview;
+  startedAt: string;
+}
+
 export interface NestedToolCallRecord extends NestedToolCallIdentity {
   durationMs: number;
   errorPreview?: NestedToolCallPreview;
@@ -82,11 +87,20 @@ export interface NestedToolCallRecord extends NestedToolCallIdentity {
 
 export type NestedToolBeforeHandler = (event: NestedToolCall) => void | Promise<void>;
 export type NestedToolAfterHandler = (event: NestedToolCallOutcome) => void | Promise<void>;
+export type NestedToolDispatchResult = Awaited<
+  ReturnType<AnyToolDefinition["execute"]>
+>;
+export type NestedToolDispatcher = (
+  event: NestedToolCall,
+  definition: AnyToolDefinition,
+  ctx: ExtensionContext,
+) => NestedToolDispatchResult | Promise<NestedToolDispatchResult>;
 
 export interface NestedToolRegistration {
   after?: NestedToolAfterHandler;
   before?: NestedToolBeforeHandler;
   definition: AnyToolDefinition;
+  dispatch?: NestedToolDispatcher;
 }
 
 export type NestedToolRegistrationInput = AnyToolDefinition | NestedToolRegistration;
@@ -99,6 +113,7 @@ export interface PythonToolRegistration extends NestedToolRegistration {
 export interface HostFunctionIdentityOptions {
   onCall?: (identity: NestedToolCallIdentity) => void;
   onOutcome?: (outcome: NestedToolCallOutcome) => void;
+  onStart?: (started: NestedToolCallStartRecord) => void;
   parentToolCallId?: string;
 }
 
@@ -179,6 +194,17 @@ const nestedUsage = (result: unknown): NestedToolUsage | undefined => {
     totalTokens: usage.totalTokens,
   };
 };
+
+export const createNestedToolCallStartRecord = (
+  call: NestedToolCall,
+): NestedToolCallStartRecord => ({
+  childToolCallId: call.childToolCallId,
+  inputPreview: jsonPreview(call.input),
+  parentToolCallId: call.parentToolCallId,
+  pythonName: call.pythonName,
+  registeredName: call.registeredName,
+  startedAt: call.startedAt,
+});
 
 export const createNestedToolCallRecord = (
   outcome: NestedToolCallOutcome,
@@ -722,7 +748,7 @@ export const createHostFunctions = (
 ): HostFunctions =>
   Object.fromEntries(
     definitions.map((item) => {
-      const { after, before, definition, pythonName, registeredName } =
+      const { after, before, definition, dispatch, pythonName, registeredName } =
         normalizeRegistration(item);
       return [
         pythonName,
@@ -744,9 +770,10 @@ export const createHostFunctions = (
             startedAt,
             toolName: registeredName,
           };
+          identityOptions.onStart?.(createNestedToolCallStartRecord(call));
           let error: unknown;
           let output: string | undefined;
-          let result: unknown;
+          let result: NestedToolDispatchResult | undefined;
           let status: NestedToolCallStatus = "failed";
           let validationFailed = false;
           try {
@@ -782,13 +809,20 @@ export const createHostFunctions = (
               }
             }
             result = await withAbort(
-              definition.execute(identity.childToolCallId, prepared, signal, undefined, ctx),
+              Promise.resolve(
+                dispatch
+                  ? dispatch(call, definition, ctx)
+                  : definition.execute(
+                      identity.childToolCallId,
+                      prepared,
+                      signal,
+                      undefined,
+                      ctx,
+                    ),
+              ),
               signal,
             );
-            output = await flattenToolResult(
-              result as { content?: { type: string; text?: string }[]; details?: unknown },
-              registeredName,
-            );
+            output = await flattenToolResult(result, registeredName);
             status = "success";
             return output;
           } catch (cause) {

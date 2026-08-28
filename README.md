@@ -42,7 +42,8 @@ pi --no-extensions -e .
 - Reads saved source without execution through `code_execution_source`.
 - Recovers retained output without rerunning side effects through
   `code_execution_output`.
-- Lets trusted Pi extensions explicitly expose selected tools to Python.
+- Lets trusted Pi extensions expose selected tools through an async, auditable
+  nested-call lifecycle.
 
 Example with a third-party dependency:
 
@@ -156,7 +157,14 @@ Expected non-success results keep their details and retained output, then the
 extension marks them as Pi tool errors. Invalid inputs, corrupt artifacts,
 stream callback defects, and other internal extension errors still throw.
 `outputRef` is absent for empty output or when no artifact was persisted.
-`nestedCalls` is empty until those records exist.
+`nestedCalls` contains every attempted bridged call in start order, even if the
+script later fails, reaches its deadline, or is cancelled.
+
+Each nested record has stable parent and child IDs, the registered Pi name, the
+Python callable name, an ISO start time, a monotonic duration, and a terminal
+status. Input, result, and error values use 4 KiB UTF-8 previews with exact byte
+counts and truncation flags. Compatible nested `usage` values stay on each
+record and are summed once into the outer Pi tool result.
 
 ## Tool bridge
 
@@ -191,9 +199,85 @@ Calls are schema-validated in the Pi process. Bridged tool output is returned
 as text. If a Pi tool stored a larger truncated result, code execution can
 recover up to 5 MiB from that tool's output artifact.
 
-Policy extensions can inspect or block nested calls through the
-`code_execution:tool_call` event. Its mutable event object contains `toolName`,
-`input`, `cwd`, and optional `block` and `reason` fields.
+### Nested lifecycle registration
+
+`collection.add(...definitions)` remains the short form. Use
+`collection.register()` when one integration owns policy or telemetry for a
+tool:
+
+```typescript
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  CodeExecutionToolCollection,
+  NestedToolCall,
+  NestedToolCallOutcome,
+} from "@jawfish/pi-code-execution/host";
+
+import { approveNestedCall, recordNestedCall } from "./policy.ts";
+import { issueSearchTool } from "./issue-search.ts";
+
+export default function (pi: ExtensionAPI): void {
+  pi.registerTool(issueSearchTool);
+  pi.events.on("code_execution:collect_tools", (event) => {
+    (event as CodeExecutionToolCollection).register(issueSearchTool, {
+      before: async (call: NestedToolCall) => {
+        if (!(await approveNestedCall(call))) {
+          throw new Error(`Approval denied for ${call.registeredName}`);
+        }
+      },
+      after: async (outcome: NestedToolCallOutcome) => {
+        await recordNestedCall(outcome);
+      },
+    });
+  });
+}
+```
+
+A `before` handler can approve or block before the tool runs. Throwing blocks
+the call with a catchable Python `RuntimeError`. The `after` handler runs once
+for success, validation failure, block, tool failure, or cancellation. Both
+handlers receive the outer ID, stable child ID, registered name, Python name,
+start time, and the run's cancellation signal.
+
+The lifecycle order is fixed:
+
+1. Emit the bounded `code_execution:nested_tool_start` observation.
+2. Prepare and validate arguments against the registered Pi tool.
+3. Run the legacy `code_execution:tool_call` interception event.
+4. Run the registration's async `before` handler.
+5. Use the registration's dispatcher, or call its definition directly.
+6. Run the registration's async `after` handler.
+7. Emit the bounded `code_execution:nested_tool_finish` observation and attach
+   the same terminal record to the outer result.
+
+A validation failure skips steps 3 through 5. A legacy block skips steps 4 and
+5. The `after` handler and finish observation still run. Name-based checks must
+use `registeredName` or the legacy `toolName` alias. `pythonName` is only the
+normalized launcher lookup name.
+
+The start and finish observations let another extension audit calls without
+owning the registration. They expose 4 KiB previews rather than full inputs,
+results, or errors:
+
+```typescript
+pi.events.on("code_execution:nested_tool_start", (record) => {
+  console.log("nested start", record);
+});
+pi.events.on("code_execution:nested_tool_finish", (record) => {
+  console.log("nested finish", record);
+});
+```
+
+The optional registration `dispatch` function is the replaceable dispatch
+boundary. Pi 0.84 has no public API that invokes another tool through its normal
+validation, `tool_call`, approval, `tool_result`, and telemetry path. The
+extension therefore does not emit native Pi `tool_call` or `tool_result` events
+for nested calls. A future public Pi dispatcher can implement `dispatch`
+without changing Python callables or the outer `nestedCalls` contract.
+
+The legacy `code_execution:tool_call` event remains available. Its mutable event
+contains the stable identities, registered `toolName`, prepared `input`, `cwd`,
+`signal`, and optional `block` and `reason` fields.
 
 ## Security model
 

@@ -42,10 +42,11 @@ import {
   renderToolSignature,
 } from "./host.ts";
 import type {
+  NestedToolCall,
   NestedToolCallIdentity,
-  NestedToolCallOutcome,
   NestedToolCallPreflight,
   NestedToolCallRecord as HostNestedToolCallRecord,
+  NestedToolCallStartRecord,
   NestedToolRegistrationInput,
 } from "./host.ts";
 import {
@@ -260,13 +261,17 @@ const MAX_LIVE_STREAM_BYTES = Math.floor(
 );
 
 export const NESTED_TOOL_CALL_EVENT = "code_execution:tool_call";
+export const NESTED_TOOL_START_EVENT = "code_execution:nested_tool_start";
+export const NESTED_TOOL_FINISH_EVENT = "code_execution:nested_tool_finish";
 
-export interface NestedToolCallInterception {
+export interface NestedToolCallInterception extends NestedToolCall {
   block?: boolean;
-  cwd: string;
-  input: Record<string, unknown>;
   reason?: string;
-  toolName: string;
+}
+
+export interface NestedToolLifecycleObserver {
+  onFinish?: (record: NestedToolCallRecord) => void;
+  onStart?: (record: NestedToolCallStartRecord) => void;
 }
 
 type ContextMessage = ContextEvent["messages"][number];
@@ -365,7 +370,7 @@ Environment: runs with your full privileges in the session working directory (re
 
 interface NestedToolCallTracker {
   onCall: (identity: NestedToolCallIdentity) => void;
-  onOutcome: (outcome: NestedToolCallOutcome) => void;
+  onRecord: (record: NestedToolCallRecord) => void;
   records: () => NestedToolCallRecord[];
   waitForSettled: () => Promise<void>;
 }
@@ -385,9 +390,9 @@ const createNestedToolCallTracker = (): NestedToolCallTracker => {
       order.push(childToolCallId);
       pending += 1;
     },
-    onOutcome: (outcome) => {
-      if (records.has(outcome.childToolCallId)) return;
-      records.set(outcome.childToolCallId, createNestedToolCallRecord(outcome));
+    onRecord: (record) => {
+      if (records.has(record.childToolCallId)) return;
+      records.set(record.childToolCallId, record);
       pending = Math.max(0, pending - 1);
       settle();
     },
@@ -558,6 +563,7 @@ export const createCodeExecutionTool = (
     spool: OutputSpool,
     toolCallId: string,
   ) => Promise<OutputArtifactReference | undefined> = saveOutputArtifact,
+  lifecycleObserver?: NestedToolLifecycleObserver,
 ): ToolDefinition<typeof parameters, CodeExecutionDetails> => ({
   description: BASE_DESCRIPTION,
   async execute(toolCallId, input, signal, onUpdate, ctx) {
@@ -624,7 +630,12 @@ export const createCodeExecutionTool = (
       (runSignal) =>
         createHostFunctions(activeRegistrations, ctx, runSignal, preflight, {
           onCall: nestedCallTracker.onCall,
-          onOutcome: nestedCallTracker.onOutcome,
+          onOutcome: (outcome) => {
+            const record = createNestedToolCallRecord(outcome);
+            nestedCallTracker.onRecord(record);
+            lifecycleObserver?.onFinish?.(record);
+          },
+          onStart: lifecycleObserver?.onStart,
           parentToolCallId: toolCallId,
         }),
       ({ stream, text }) => {
@@ -1017,6 +1028,14 @@ export default function codeExecutionExtension(pi: ExtensionAPI): void {
       preflight,
       getDefinitions,
       saveOutputArtifact,
+      {
+        onFinish: (record) => {
+          pi.events.emit(NESTED_TOOL_FINISH_EVENT, structuredClone(record));
+        },
+        onStart: (record) => {
+          pi.events.emit(NESTED_TOOL_START_EVENT, structuredClone(record));
+        },
+      },
     ),
   );
   pi.registerTool(createCodeExecutionOutputTool(loadOutputArtifact));

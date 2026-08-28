@@ -23,6 +23,8 @@ import {
   createCodeExecutionSourceTool,
   createCodeExecutionTool as createProductionCodeExecutionTool,
   executeForTest,
+  NESTED_TOOL_FINISH_EVENT,
+  NESTED_TOOL_START_EVENT,
   readOutputForTest,
   readSourceForTest,
 } from "./index.ts";
@@ -30,6 +32,7 @@ import type {
   CodeExecutionDetails,
   CodeExecutionFinalDetails,
   CodeExecutionInput,
+  NestedToolLifecycleObserver,
 } from "./index.ts";
 import { loadOutputArtifact, saveOutputArtifact } from "./output-artifacts.ts";
 import type { OutputArtifactReference } from "./output-artifacts.ts";
@@ -77,6 +80,7 @@ const createCodeExecutionTool = (
   loadArtifact?: CreateToolParameters[3],
   preflight?: CreateToolParameters[4],
   getDefinitions?: CreateToolParameters[5],
+  lifecycleObserver?: NestedToolLifecycleObserver,
 ) =>
   createProductionCodeExecutionTool(
     runner,
@@ -86,6 +90,7 @@ const createCodeExecutionTool = (
     preflight,
     getDefinitions,
     () => Promise.resolve(undefined),
+    lifecycleObserver,
   );
 
 const createArtifactCodeExecutionTool = (
@@ -463,9 +468,66 @@ describe("code_execution tool", () => {
     }
   });
 
+  test("emits bounded nested start and finish observations", async () => {
+    const dir = await tempDir();
+    const runner = new SandboxRunner();
+    const search = definition("Kagi/search");
+    const starts: Parameters<NonNullable<NestedToolLifecycleObserver["onStart"]>>[0][] = [];
+    const finishes: Parameters<NonNullable<NestedToolLifecycleObserver["onFinish"]>>[0][] = [];
+    const tool = createCodeExecutionTool(
+      runner,
+      saveTestArtifact,
+      () => ["Kagi/search"],
+      undefined,
+      undefined,
+      () => [search],
+      {
+        onFinish: (record) => finishes.push(record),
+        onStart: (record) => starts.push(record),
+      },
+    );
+    try {
+      const result = await tool.execute(
+        "observed-parent",
+        { code: "print(await Kagi_search(query='🙂' * 2000))" },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(NESTED_TOOL_START_EVENT).toBe("code_execution:nested_tool_start");
+      expect(NESTED_TOOL_FINISH_EVENT).toBe("code_execution:nested_tool_finish");
+      expect(starts).toHaveLength(1);
+      expect(finishes).toHaveLength(1);
+      const start = starts[0];
+      const finish = finishes[0];
+      if (!start || !finish) throw new Error("expected lifecycle observations");
+      expect(start).toMatchObject({
+        inputPreview: { truncated: true },
+        parentToolCallId: "observed-parent",
+        pythonName: "Kagi_search",
+        registeredName: "Kagi/search",
+      });
+      expect(finish).toMatchObject({
+        parentToolCallId: "observed-parent",
+        resultPreview: { truncated: true },
+        status: "success",
+      });
+      expect(start.childToolCallId).toBe(finish.childToolCallId);
+      expect(Buffer.byteLength(start.inputPreview.text, "utf-8")).toBeLessThanOrEqual(4096);
+      expect(Buffer.byteLength(finish.resultPreview?.text ?? "", "utf-8"))
+        .toBeLessThanOrEqual(4096);
+      expect("input" in start).toBeFalse();
+      expect("result" in finish).toBeFalse();
+      expect(expectFinalDetails(result.details).nestedCalls).toEqual(finishes);
+    } finally {
+      await runner.close();
+    }
+  });
+
   test("records bounded nested outcomes and aggregates usage once", async () => {
     const dir = await tempDir();
     const runner = new SandboxRunner();
+    const approvals: string[] = [];
     const sideEffects: string[] = [];
     const usage = (factor: number) => ({
       cacheRead: 3 * factor,
@@ -525,7 +587,14 @@ describe("code_execution tool", () => {
       () => definitions.map(({ name }) => name),
       undefined,
       undefined,
-      () => definitions,
+      () =>
+        definitions.map((nestedDefinition) => ({
+          before: async (call: NestedToolCall) => {
+            await Promise.resolve();
+            approvals.push(call.registeredName);
+          },
+          definition: nestedDefinition,
+        })),
     );
     try {
       const result = await tool.execute(
@@ -554,6 +623,7 @@ describe("code_execution tool", () => {
         { cwd: dir } as ExtensionContext,
       );
       expect(expectFinalDetails(result.details).status).toBe("runtime_error");
+      expect(approvals).toEqual(["mutate", "meter", "fail"]);
       expect(sideEffects).toEqual(["mutated"]);
       const calls = expectFinalDetails(result.details).nestedCalls;
       expect(calls.map(({ registeredName }) => registeredName)).toEqual([
