@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -18,9 +18,11 @@ import {
 import type { AnyToolDefinition } from "./host.ts";
 import {
   codeExecutionResultOverride,
+  createCodeExecutionOutputTool,
   createCodeExecutionSourceTool,
   createCodeExecutionTool,
   executeForTest,
+  readOutputForTest,
   readSourceForTest,
 } from "./index.ts";
 import type {
@@ -28,6 +30,8 @@ import type {
   CodeExecutionFinalDetails,
   CodeExecutionInput,
 } from "./index.ts";
+import { loadOutputArtifact, saveOutputArtifact } from "./output-artifacts.ts";
+import type { OutputArtifactReference } from "./output-artifacts.ts";
 import { SandboxRunner } from "./runner.ts";
 
 const dirs: string[] = [];
@@ -39,6 +43,26 @@ const tempDir = async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "pi-code-execution-index-"));
   dirs.push(dir);
   return dir;
+};
+
+const retainOutput = async (
+  root: string,
+  code: string,
+  toolCallId = "retained-output",
+): Promise<OutputArtifactReference> => {
+  const runner = new SandboxRunner();
+  let outputRef: OutputArtifactReference | undefined;
+  try {
+    await runner.run(code, {}, undefined, {
+      outputSpoolConsumer: async (spool) => {
+        outputRef = await saveOutputArtifact(spool, toolCallId, root);
+      },
+    });
+  } finally {
+    await runner.close();
+  }
+  if (!outputRef) throw new Error("expected retained output");
+  return outputRef;
 };
 
 const artifactId = "0123456789abcdef.py";
@@ -125,12 +149,15 @@ describe("code_execution tool", () => {
     expect(tool.description).toContain("recovered automatically up to 5MB");
     expect(tool.description).toContain("structured `sourceRef`");
     expect(tool.description).toContain("Never put a legacy");
+    expect(tool.description).toContain("`outputRef`");
+    expect(tool.description).toContain("without rerunning side effects");
     expect(tool.description).not.toContain("Typical pattern:");
     expect(tool.description).toContain("reason in your response text");
     expect(tool.promptGuidelines).toEqual([
       expect.stringContaining("use a direct tool call for one untransformed result"),
       expect.stringContaining("filter or summarize"),
       expect.stringContaining("sourceRef unchanged"),
+      expect.stringContaining("unchanged outputRef"),
     ]);
     void runner.close();
   });
@@ -836,6 +863,146 @@ describe("code_execution tool", () => {
     expect(codeExecutionResultOverride("code_execution", { status: "success" })).toBeUndefined();
     expect(codeExecutionResultOverride("code_execution", { status: "running" })).toBeUndefined();
     expect(codeExecutionResultOverride("read", { status: "runtime_error" })).toBeUndefined();
+  });
+});
+
+describe("code_execution_output tool", () => {
+  test("recovers paged UTF-8 output byte-for-byte", async () => {
+    const dir = await tempDir();
+    const root = path.join(dir, "output-artifacts");
+    const expected = "abcé🙂tail\n";
+    const outputRef = await retainOutput(
+      root,
+      `import sys\nsys.stdout.write(${JSON.stringify(expected)})\nsys.stdout.flush()`,
+    );
+    const tool = createCodeExecutionOutputTool((reference) =>
+      loadOutputArtifact(reference, root),
+    );
+    const chunks: string[] = [];
+    const offsets: number[] = [];
+    let offset = 0;
+    for (;;) {
+      const result = await readOutputForTest(
+        tool,
+        { limit: 4, offset, outputRef },
+        { cwd: dir } as ExtensionContext,
+      );
+      const chunk = result.details?.chunk ?? "";
+      chunks.push(chunk);
+      offsets.push(result.details?.offset ?? -1);
+      expect(Buffer.byteLength(chunk, "utf-8")).toBeLessThanOrEqual(4);
+      expect(result.content[0]).toEqual({ text: chunk, type: "text" });
+      expect(result.details).toMatchObject({
+        artifactId: outputRef.artifactId,
+        emittedBytes: outputRef.emittedBytes,
+        lines: outputRef.lines,
+        retainedBytes: outputRef.retainedBytes,
+        retainedLines: outputRef.retainedLines,
+        truncated: false,
+      });
+      const nextOffset = result.details?.nextOffset;
+      if (nextOffset === undefined) break;
+      expect(nextOffset).toBeGreaterThan(offset);
+      expect(result.content[1]).toEqual({
+        text: `Output continues at byte offset ${nextOffset} of ${outputRef.retainedBytes}`,
+        type: "text",
+      });
+      offset = nextOffset;
+    }
+    expect(chunks.join("")).toBe(expected);
+    expect(Buffer.from(chunks.join(""), "utf-8")).toEqual(Buffer.from(expected, "utf-8"));
+    expect(offsets).toEqual([...offsets].sort((left, right) => left - right));
+  });
+
+  test("rejects unsafe ranges and changed references", async () => {
+    const dir = await tempDir();
+    const root = path.join(dir, "output-artifacts");
+    const outputRef = await retainOutput(
+      root,
+      "import sys\nsys.stdout.write('abcé🙂')\nsys.stdout.flush()",
+    );
+    const tool = createCodeExecutionOutputTool((reference) =>
+      loadOutputArtifact(reference, root),
+    );
+    const context = { cwd: dir } as ExtensionContext;
+
+    await expect(
+      readOutputForTest(tool, { limit: 4, offset: 4, outputRef }, context),
+    ).rejects.toThrow(/inside a UTF-8 character/iu);
+    await expect(
+      readOutputForTest(
+        tool,
+        { offset: outputRef.retainedBytes + 1, outputRef },
+        context,
+      ),
+    ).rejects.toThrow(/exceeds/iu);
+    await expect(
+      readOutputForTest(tool, { limit: 3, outputRef }, context),
+    ).rejects.toThrow(/between 4 and 20480/iu);
+    await expect(
+      readOutputForTest(
+        tool,
+        {
+          outputRef: {
+            ...outputRef,
+            emittedBytes: outputRef.emittedBytes + 1,
+            truncated: true,
+          },
+        },
+        context,
+      ),
+    ).rejects.toThrow(/invalid, corrupt, or does not match/iu);
+  });
+
+  test("distinguishes unavailable and corrupt output artifacts", async () => {
+    const dir = await tempDir();
+    const root = path.join(dir, "output-artifacts");
+    const unavailableRef = await retainOutput(root, "print('unavailable')", "missing-call");
+    const tool = createCodeExecutionOutputTool((reference) =>
+      loadOutputArtifact(reference, root),
+    );
+    await rm(path.join(root, unavailableRef.artifactId));
+    const unavailable = await readOutputForTest(
+      tool,
+      { outputRef: unavailableRef },
+      { cwd: dir } as ExtensionContext,
+    );
+    expect(unavailable.content[0]?.type === "text" && unavailable.content[0].text).toContain(
+      "unavailable",
+    );
+    expect(unavailable.content[0]?.type === "text" && unavailable.content[0].text).toContain(
+      "Do not retry",
+    );
+    expect(unavailable.details?.unavailable).toBeTrue();
+
+    const corruptRef = await retainOutput(root, "print('corrupt')", "corrupt-call");
+    await writeFile(path.join(root, corruptRef.artifactId), "changed");
+    await expect(
+      readOutputForTest(
+        tool,
+        { outputRef: corruptRef },
+        { cwd: dir } as ExtensionContext,
+      ),
+    ).rejects.toThrow(/invalid, corrupt, or does not match/iu);
+  });
+
+  test("advertises recovery and ships its public artifact module", async () => {
+    const tool = createCodeExecutionOutputTool();
+    expect(tool.name).toBe("code_execution_output");
+    expect(tool.description).toContain("Pass the outputRef unchanged");
+    expect(tool.description).toContain("continuation offset");
+    expect(tool.promptGuidelines).toEqual([
+      expect.stringContaining("without rerunning side effects"),
+    ]);
+    expect(typeof tool.renderCall).toBe("function");
+    expect(typeof tool.renderResult).toBe("function");
+
+    const manifest = JSON.parse(await readFile("package.json", "utf-8")) as {
+      exports: Record<string, string>;
+      files: string[];
+    };
+    expect(manifest.files).toContain("output-artifacts.ts");
+    expect(manifest.exports["./output-artifacts"]).toBe("./output-artifacts.ts");
   });
 });
 
