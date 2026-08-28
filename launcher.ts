@@ -12,6 +12,7 @@ export const USER_SCRIPT_NAME = "your_code.py";
 const LAUNCHER_BODY = `import ast
 import asyncio
 import builtins
+import inspect
 import json
 import linecache
 import os
@@ -181,7 +182,7 @@ def _install_tools():
     }
 
 
-async def _main(path):
+def _main(path):
     with open(path, "r", encoding="utf-8") as handle:
         source = handle.read()
     # Register the source under a stable name so tracebacks show real lines
@@ -201,9 +202,10 @@ async def _main(path):
     sys.argv = [_SCRIPT]
     code = compile(source, _SCRIPT, "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
     namespace = {"__name__": "__main__", "__file__": _SCRIPT}
-    result = eval(code, namespace)
-    if result is not None:
-        await result
+    if code.co_flags & inspect.CO_COROUTINE:
+        asyncio.run(eval(code, namespace))
+    else:
+        exec(code, namespace)
 
 
 def _report(exc):
@@ -218,7 +220,7 @@ def _run():
     _start_watchdog()
     _install_tools()
     try:
-        asyncio.run(_main(sys.argv[1]))
+        _main(sys.argv[1])
     except SystemExit:
         raise
     except BaseException as exc:

@@ -277,6 +277,21 @@ describe("SandboxRunner", () => {
     });
   });
 
+  test("lets ordinary scripts manage their own event loop", async () => {
+    await withRunner(async (runner) => {
+      const result = await runner.run(
+        [
+          "import asyncio",
+          "async def main():",
+          "    await asyncio.sleep(0.01)",
+          "    return 'managed'",
+          "print(asyncio.run(main()))",
+        ].join("\n"),
+      );
+      expect(result.stdout).toBe("managed\n");
+    });
+  });
+
   test("allows top-level await", async () => {
     await withRunner(async (runner) => {
       const result = await runner.run("import asyncio\nawait asyncio.sleep(0.01)\nprint('slept')");
