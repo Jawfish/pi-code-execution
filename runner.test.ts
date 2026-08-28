@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
+  DEFAULT_MAX_RETAINED_OUTPUT_BYTES,
   DEFAULT_MAX_STDERR_BYTES,
   DEFAULT_MAX_STDOUT_BYTES,
   MISSING_UV_MESSAGE,
@@ -67,9 +68,10 @@ const expectTimedOutcome = (result: RunResult): void => {
 };
 
 describe("SandboxRunner", () => {
-  test("caps default stdout and stderr capture at 20 KiB", () => {
+  test("caps previews at 20 KiB and retained output at 64 MiB", () => {
     expect(DEFAULT_MAX_STDOUT_BYTES).toBe(20 * 1024);
     expect(DEFAULT_MAX_STDERR_BYTES).toBe(20 * 1024);
+    expect(DEFAULT_MAX_RETAINED_OUTPUT_BYTES).toBe(64 * 1024 * 1024);
   });
 
   test("runs under Node, Pi's extension runtime", async () => {
@@ -124,6 +126,124 @@ describe("SandboxRunner", () => {
         .toBe("hello\n");
       expect(streamed.filter(({ stream }) => stream === "stderr").map(({ text }) => text).join(""))
         .toBe("warning\n");
+    });
+  });
+
+  test("spools both streams from their first bytes with exact metadata", async () => {
+    await withRunner(async (runner) => {
+      const spoolPaths: string[] = [];
+      let spooledStdout = Buffer.alloc(0);
+      let spooledStderr = Buffer.alloc(0);
+      const result = await runner.run(
+        [
+          "import sys",
+          "sys.stdout.write('alpha\\nbeta')",
+          "sys.stdout.flush()",
+          "sys.stderr.write('warn\\nlast\\n')",
+          "sys.stderr.flush()",
+        ].join("\n"),
+        {},
+        undefined,
+        {
+          outputSpoolConsumer: async (spool) => {
+            spoolPaths.push(spool.stdout.path, spool.stderr.path);
+            spooledStdout = await readFile(spool.stdout.path);
+            spooledStderr = await readFile(spool.stderr.path);
+            expect(spool).toMatchObject({
+              retainedBytes: 20,
+              retentionTruncated: false,
+              stderr: {
+                emittedBytes: 10,
+                emittedLines: 2,
+                endsWithNewline: true,
+                retainedBytes: 10,
+              },
+              stdout: {
+                emittedBytes: 10,
+                emittedLines: 2,
+                endsWithNewline: false,
+                retainedBytes: 10,
+              },
+            });
+            if (process.platform !== "win32") {
+              for (const file of spoolPaths) {
+                const metadata = await stat(file);
+                // File modes are represented as a bit mask.
+                // oxlint-disable-next-line eslint/no-bitwise
+                expect(metadata.mode & 0o777).toBe(0o600);
+              }
+            }
+          },
+        },
+      );
+      expect(spooledStdout.toString("utf-8")).toBe("alpha\nbeta");
+      expect(spooledStderr.toString("utf-8")).toBe("warn\nlast\n");
+      expect(result).toMatchObject({
+        outputRetentionTruncated: false,
+        retainedOutputBytes: 20,
+        outputPreview: {
+          stderr: { head: "warn\nlast\n", tail: "", truncated: false },
+          stdout: { head: "alpha\nbeta", tail: "", truncated: false },
+        },
+        stderrBytes: 10,
+        stderrLines: 2,
+        stdoutBytes: 10,
+        stdoutLines: 2,
+      });
+      for (const file of spoolPaths) {
+        await expect(stat(file)).rejects.toThrow();
+      }
+    });
+  });
+
+  test("keeps a bounded head-tail preview beyond the spool ceiling", async () => {
+    await withRunner(async (runner) => {
+      const emitted = `HEAD-${"x".repeat(100)}-TAIL`;
+      const emittedStderr = "second-stream";
+      let retainedStdout = Buffer.alloc(0);
+      let retainedStderr = Buffer.alloc(0);
+      const result = await runner.run(
+        [
+          "import sys",
+          `sys.stdout.write(${JSON.stringify(emitted)})`,
+          "sys.stdout.flush()",
+          `sys.stderr.write(${JSON.stringify(emittedStderr)})`,
+          "sys.stderr.flush()",
+        ].join("\n"),
+        {},
+        undefined,
+        {
+          maxRetainedOutputBytes: 24,
+          maxStdoutBytes: 20,
+          outputSpoolConsumer: async (spool) => {
+            retainedStdout = await readFile(spool.stdout.path);
+            retainedStderr = await readFile(spool.stderr.path);
+            expect(spool.retainedBytes).toBe(24);
+            expect(spool.retentionTruncated).toBeTrue();
+          },
+        },
+      );
+      expect(retainedStdout.length + retainedStderr.length).toBe(24);
+      expect(emitted).toStartWith(retainedStdout.toString("utf-8"));
+      expect(emittedStderr).toStartWith(retainedStderr.toString("utf-8"));
+      expect(result).toMatchObject({
+        outputRetentionTruncated: true,
+        retainedOutputBytes: 24,
+        stdoutBytes: 110,
+        stdoutLines: 1,
+        stdoutTruncated: true,
+      });
+      expect(result.outputPreview.stdout).toEqual({
+        head: "HEAD-xxxxx",
+        tail: "xxxxx-TAIL",
+        truncated: true,
+      });
+      expect(
+        Buffer.byteLength(
+          result.outputPreview.stdout.head + result.outputPreview.stdout.tail,
+          "utf-8",
+        ),
+      ).toBeLessThanOrEqual(20);
     });
   });
 
@@ -198,7 +318,17 @@ describe("SandboxRunner", () => {
 
   test("retains stdout when user code fails", async () => {
     await withRunner(async (runner) => {
-      const result = await runner.run("print('important stdout', flush=True)\nraise RuntimeError('boom')");
+      const spoolPaths: string[] = [];
+      const result = await runner.run(
+        "print('important stdout', flush=True)\nraise RuntimeError('boom')",
+        {},
+        undefined,
+        {
+          outputSpoolConsumer: (spool) => {
+            spoolPaths.push(spool.stdout.path, spool.stderr.path);
+          },
+        },
+      );
       expect(result).toMatchObject({
         exitCode: 1,
         status: "runtime_error",
@@ -209,6 +339,9 @@ describe("SandboxRunner", () => {
       });
       expect(result.stderrBytes).toBeGreaterThan(0);
       expect(result.diagnostic).toContain("RuntimeError: boom");
+      for (const file of spoolPaths) {
+        await expect(stat(file)).rejects.toThrow();
+      }
     });
   });
 
@@ -552,6 +685,7 @@ describe("SandboxRunner", () => {
       const directory = await makeTempDir();
       const pidFile = path.join(directory, "pid");
       const controller = new AbortController();
+      const spoolPaths: string[] = [];
       let pid: number | undefined;
       try {
         const run = runner.run(
@@ -563,7 +697,13 @@ describe("SandboxRunner", () => {
           ].join("\n"),
           {},
           undefined,
-          { signal: controller.signal, timeoutSecs: 30 },
+          {
+            outputSpoolConsumer: (spool) => {
+              spoolPaths.push(spool.stdout.path, spool.stderr.path);
+            },
+            signal: controller.signal,
+            timeoutSecs: 30,
+          },
         );
         await waitForFile(pidFile);
         pid = Number(await readFile(pidFile, "utf-8"));
@@ -578,6 +718,9 @@ describe("SandboxRunner", () => {
         });
         expectTimedOutcome(result);
         await waitForProcessExit(pid);
+        for (const file of spoolPaths) {
+          await expect(stat(file)).rejects.toThrow();
+        }
       } finally {
         if (pid && processExists(pid)) process.kill(pid, "SIGKILL");
         await rm(directory, { force: true, recursive: true });
@@ -590,6 +733,7 @@ describe("SandboxRunner", () => {
     await withRunner(async (runner) => {
       const directory = await makeTempDir();
       const pidFile = path.join(directory, "pid");
+      const spoolPaths: string[] = [];
       let pid: number | undefined;
       try {
         const result = await runner.run(
@@ -602,7 +746,12 @@ describe("SandboxRunner", () => {
           ].join("\n"),
           {},
           undefined,
-          { timeoutSecs: 1 },
+          {
+            outputSpoolConsumer: (spool) => {
+              spoolPaths.push(spool.stdout.path, spool.stderr.path);
+            },
+            timeoutSecs: 1,
+          },
         );
         expect(result.status).toBe("timeout");
         expect(result.diagnostic).toMatch(/deadline/iu);
@@ -613,6 +762,9 @@ describe("SandboxRunner", () => {
         });
         pid = Number(await readFile(pidFile, "utf-8"));
         await waitForProcessExit(pid);
+        for (const file of spoolPaths) {
+          await expect(stat(file)).rejects.toThrow();
+        }
       } finally {
         if (pid && processExists(pid)) process.kill(pid, "SIGKILL");
         await rm(directory, { force: true, recursive: true });
@@ -723,24 +875,37 @@ describe("SandboxRunner", () => {
   test("stops the script when either channel callback fails", async () => {
     await withRunner(async (runner) => {
       for (const stream of ["stdout", "stderr"] as const) {
+        const spoolPaths: string[] = [];
         const print =
           stream === "stdout"
             ? "print('ready', flush=True)"
             : "print('ready', file=sys.stderr, flush=True)";
         const started = Date.now();
         await expect(
-          runner.run(`import sys, time\n${print}\ntime.sleep(30)`, {}, (chunk) => {
-            if (chunk.stream === stream) throw new Error(`${stream} consumer failed`);
-          }),
+          runner.run(
+            `import sys, time\n${print}\ntime.sleep(30)`,
+            {},
+            (chunk) => {
+              if (chunk.stream === stream) throw new Error(`${stream} consumer failed`);
+            },
+            {
+              outputSpoolConsumer: (spool) => {
+                spoolPaths.push(spool.stdout.path, spool.stderr.path);
+              },
+            },
+          ),
         ).rejects.toThrow(`${stream} consumer failed`);
         expect(Date.now() - started).toBeLessThan(3000);
+        for (const file of spoolPaths) {
+          await expect(stat(file)).rejects.toThrow();
+        }
       }
     });
   });
 
-  test("removes the private watchdog marker from the script environment", async () => {
+  test("removes the private watchdog path from the script environment", async () => {
     await withRunner(async (runner) => {
-      const result = await runner.run("import os\nprint('PI_WATCHDOG_MARKER' in os.environ)");
+      const result = await runner.run("import os\nprint('PI_WATCHDOG_PATH' in os.environ)");
       expect(result.stdout).toBe("False\n");
     });
   });

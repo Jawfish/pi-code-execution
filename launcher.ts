@@ -43,13 +43,17 @@ def _start_watchdog():
     except ValueError:
         return
 
-    marker = os.environ.pop("PI_WATCHDOG_MARKER", "")
+    marker_path = os.environ.pop("PI_WATCHDOG_PATH", "")
 
     def expire():
+        if marker_path:
+            try:
+                marker = os.open(marker_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(marker)
+            except OSError:
+                pass
         sys.stdout.flush()
-        sys.stderr.write(
-            marker + " The run exceeded its " + raw + "s deadline and was stopped.\\n"
-        )
+        sys.stderr.write("The run exceeded its " + raw + "s deadline and was stopped.\\n")
         sys.stderr.flush()
         os._exit(124)
 

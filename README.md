@@ -28,7 +28,8 @@ pi --no-extensions -e .
 - Resolves relative paths and local imports from the Pi session directory.
 - Installs script dependencies declared with
   [PEP 723](https://peps.python.org/pep-0723/) through `uv`.
-- Streams stdout and stderr while the script runs and bounds retained output.
+- Streams stdout and stderr while the script runs, keeps bounded live and final
+  previews, and retains up to 64 MiB in a verified output artifact.
 - Runs sequentially with sibling calls in the same Pi tool batch, so they cannot
   race with the script's filesystem or subprocess work.
 - Keeps explicit concurrency inside one script: bridged calls passed to
@@ -39,6 +40,8 @@ pi --no-extensions -e .
   replaces them with structured `sourceRef` values in model context.
 - Replays an exact saved script from its verified `sourceRef`.
 - Reads saved source without execution through `code_execution_source`.
+- Recovers retained output without rerunning side effects through
+  `code_execution_output`.
 - Lets trusted Pi extensions explicitly expose selected tools to Python.
 
 Example with a third-party dependency:
@@ -76,6 +79,37 @@ Legacy path-bearing and XML-like references remain readable for resumed
 sessions. New references contain no machine-specific absolute path. A final
 execution result rebuilds the reference from the exact loaded source, keeps the
 verified artifact ID, and records the current outer tool-call ID.
+
+## Saved output references
+
+A run with nonempty output stores a canonical stdout-then-stderr transcript.
+The transcript uses `[stderr]` as its channel boundary. Successful and expected
+failure details include a portable reference when the artifact was saved:
+
+```typescript
+type OutputArtifactReference = {
+  artifactId: string;
+  sha256: string;
+  emittedBytes: number;
+  lines: number;
+  retainedBytes: number;
+  retainedLines: number;
+  truncated: boolean;
+  toolCallId: string;
+};
+```
+
+The extension retains at most 64 MiB per run. It continues to drain and count
+output after that ceiling. The final result stays within 20 KiB and shows a
+head-tail preview with exact emitted and omitted counts. It also states whether
+all retained output is recoverable or whether the artifact itself was
+truncated.
+
+Pass the complete `outputRef` unchanged to `code_execution_output`. The reader
+accepts optional UTF-8 byte `offset` and `limit` values, caps each page at 20
+KiB, never splits a UTF-8 character, and returns the next stable byte offset.
+It verifies the reference, content digest, metadata, permissions, and
+regular-file boundary before every read. References contain no absolute paths.
 
 ## Execution outcomes
 
@@ -121,7 +155,8 @@ type CodeExecutionRunningDetails = {
 Expected non-success results keep their details and retained output, then the
 extension marks them as Pi tool errors. Invalid inputs, corrupt artifacts,
 stream callback defects, and other internal extension errors still throw.
-`outputRef` is optional, and `nestedCalls` is empty until those records exist.
+`outputRef` is absent for empty output or when no artifact was persisted.
+`nestedCalls` is empty until those records exist.
 
 ## Tool bridge
 
@@ -180,10 +215,10 @@ not supported because Node does not provide equivalent process-tree
 containment without an additional native job-object implementation.
 
 Older sources are stored under Pi's agent directory in `code-execution/`.
-Directories and files use private POSIX modes where supported. Artifacts remain
-until the user removes them, and any process running as the same user may read
-them. Session placeholders contain artifact IDs, not machine-specific absolute
-paths.
+Retained transcripts are stored in `code-execution-output/`. Directories and
+files use private POSIX modes where supported. Artifacts remain until the user
+removes them, and any process running as the same user may read them. Session
+references contain artifact IDs, not machine-specific absolute paths.
 
 ## Development
 

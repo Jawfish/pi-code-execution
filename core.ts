@@ -3,6 +3,20 @@ import { truncateHead } from "@earendil-works/pi-coding-agent";
 export const MAX_CODE_EXECUTION_OUTPUT_BYTES = 20 * 1024;
 export const NO_OUTPUT = "(no output)";
 
+const PREVIEW_NOTICE_RESERVE_BYTES = 1024;
+const PREVIEW_DIAGNOSTIC_BYTES = 4 * 1024;
+
+export interface HeadTailOutputPreview {
+  artifactTruncated: boolean;
+  complete?: string;
+  diagnostic?: string;
+  emittedBytes: number;
+  emittedLines: number;
+  head: string;
+  retainedBytes: number;
+  tail: string;
+}
+
 /** Keep a UTF-8-safe rolling tail for bounded live rendering. */
 export const appendLiveOutputTail = (current: string, chunk: string, maxBytes: number): string => {
   const combined = Buffer.from(current + chunk);
@@ -24,6 +38,75 @@ export const assembleOutput = (stdout: string, stderr = ""): string => {
     parts.push(`[stderr]\n${stderr.replace(/\n$/u, "")}`);
   }
   return parts.join("\n") || NO_OUTPUT;
+};
+
+const utf8Head = (value: string, maxBytes: number): string =>
+  Buffer.from(value, "utf-8")
+    .subarray(0, Math.max(0, maxBytes))
+    .toString("utf-8")
+    .replace(/\uFFFD+$/u, "");
+
+const utf8Tail = (value: string, maxBytes: number): string => {
+  const bytes = Buffer.from(value, "utf-8");
+  return bytes
+    .subarray(Math.max(0, bytes.length - Math.max(0, maxBytes)))
+    .toString("utf-8")
+    .replace(/^\uFFFD+/u, "");
+};
+
+/** Render exact output metadata around a bounded raw head and tail. */
+export const formatHeadTailOutput = (
+  preview: HeadTailOutputPreview,
+  maxBytes = MAX_CODE_EXECUTION_OUTPUT_BYTES,
+): string => {
+  const diagnostic = preview.diagnostic
+    ? utf8Tail(preview.diagnostic, PREVIEW_DIAGNOSTIC_BYTES)
+    : "";
+  const diagnosticBytes = Buffer.byteLength(diagnostic, "utf-8");
+  const rawBudget = Math.max(
+    0,
+    maxBytes - PREVIEW_NOTICE_RESERVE_BYTES - diagnosticBytes,
+  );
+  const completeBytes = preview.complete
+    ? Buffer.byteLength(preview.complete, "utf-8")
+    : undefined;
+  let head =
+    preview.complete && completeBytes !== undefined && completeBytes <= rawBudget
+      ? preview.complete
+      : utf8Head(preview.head, Math.floor(rawBudget / 2));
+  let headBytes = Buffer.byteLength(head, "utf-8");
+  let tail =
+    preview.complete && completeBytes !== undefined && completeBytes <= rawBudget
+      ? ""
+      : utf8Tail(preview.tail, rawBudget - headBytes);
+  let tailBytes = Buffer.byteLength(tail, "utf-8");
+  if (!preview.complete && tailBytes < rawBudget - headBytes) {
+    head = utf8Head(preview.head, rawBudget - tailBytes);
+    headBytes = Buffer.byteLength(head, "utf-8");
+  }
+  if (!preview.complete && headBytes < rawBudget - tailBytes) {
+    tail = utf8Tail(preview.tail, rawBudget - headBytes);
+    tailBytes = Buffer.byteLength(tail, "utf-8");
+  }
+
+  const shownBytes = Math.min(preview.emittedBytes, headBytes + tailBytes);
+  const omittedBytes = preview.emittedBytes - shownBytes;
+  const previewNotice = `[Output preview truncated: showing the first ${headBytes} and last ${tailBytes} bytes; omitted ${omittedBytes} of ${preview.emittedBytes} emitted bytes across ${preview.emittedLines} lines.]`;
+  const artifactNotice = preview.artifactTruncated
+    ? `[Output artifact truncated: retained ${preview.retainedBytes} of ${preview.emittedBytes} emitted bytes; ${preview.emittedBytes - preview.retainedBytes} bytes cannot be recovered.]`
+    : `[Recover retained output with code_execution_output using outputRef (${preview.retainedBytes} bytes).]`;
+  const parts = [
+    head,
+    previewNotice,
+    tail,
+    artifactNotice,
+    ...(diagnostic ? [`[diagnostic]\n${diagnostic}`] : []),
+  ].filter(Boolean);
+  const output = parts.join("\n\n");
+  if (Buffer.byteLength(output, "utf-8") > maxBytes) {
+    throw new Error("Output preview exceeded its bounded rendering budget");
+  }
+  return output;
 };
 
 export const truncateFailureOutput = (output: string): string => {
