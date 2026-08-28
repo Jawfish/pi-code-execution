@@ -8,7 +8,7 @@ import { Type } from "typebox";
 
 import { codeArtifactId, codeDigest, loadCodeArtifact, saveCodeArtifact } from "./artifacts.ts";
 import { codeSourceReference } from "./context.ts";
-import { assembleOutput, NO_OUTPUT, truncateOutput } from "./core.ts";
+import { appendLiveOutputTail, assembleOutput, NO_OUTPUT, truncateOutput } from "./core.ts";
 import type { AnyToolDefinition } from "./host.ts";
 import {
   createCodeExecutionSourceTool,
@@ -65,12 +65,20 @@ describe("output formatting", () => {
     expect(output.startsWith("x".repeat(100))).toBeTrue();
     expect(output).toContain("showing the first 20480 of 60000 bytes");
   });
+
+  test("keeps a bounded UTF-8 live tail", () => {
+    const output = appendLiveOutputTail("alpha\nbeta\n", "gamma\ndelta\n", 14);
+    expect(Buffer.byteLength(output, "utf-8")).toBeLessThanOrEqual(14);
+    expect(output).toEndWith("gamma\ndelta\n");
+    expect(output).not.toContain("alpha");
+  });
 });
 
 describe("code_execution tool", () => {
   test("advertises CPython and optional tool guidance", () => {
     const runner = new SandboxRunner();
     const tool = createCodeExecutionTool(runner);
+    expect(tool.executionMode).toBe("sequential");
     expect(tool.description).toContain("Trusted Pi extensions can opt tools");
     expect(tool.description).toContain("empty when no extension has exposed tools");
     // Filesystem and shell work is done with the standard library instead.
@@ -98,6 +106,67 @@ describe("code_execution tool", () => {
       expect.stringContaining("sourceRef unchanged"),
     ]);
     void runner.close();
+  });
+
+  test("assembles bounded live updates from both output channels", async () => {
+    const dir = await tempDir();
+    const runner = new SandboxRunner();
+    const tool = createCodeExecutionTool(runner, saveTestArtifact);
+    const updates: string[] = [];
+    try {
+      const result = await tool.execute(
+        "live-output",
+        {
+          code: [
+            "import sys",
+            "print('out', flush=True)",
+            "print('warning', file=sys.stderr, flush=True)",
+          ].join("\n"),
+        },
+        undefined,
+        (update) => {
+          const text = update.content.find((item) => item.type === "text")?.text;
+          if (text) updates.push(text);
+        },
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(result.content[0]).toEqual({ text: "out\n[stderr]\nwarning", type: "text" });
+      expect(updates.some((output) => output === "out\n[stderr]\nwarning")).toBeTrue();
+      expect(updates.every((output) => Buffer.byteLength(output) <= 20 * 1024)).toBeTrue();
+    } finally {
+      await runner.close();
+    }
+  });
+
+  test("keeps live updates rolling after final stdout capture fills", async () => {
+    const dir = await tempDir();
+    const runner = new SandboxRunner();
+    const tool = createCodeExecutionTool(runner, saveTestArtifact);
+    const updates: string[] = [];
+    try {
+      await tool.execute(
+        "rolling-output",
+        {
+          code: [
+            "import sys",
+            "for index in range(3000):",
+            "    print(f'line-{index:04}')",
+            "print('warning', file=sys.stderr, flush=True)",
+          ].join("\n"),
+        },
+        undefined,
+        (update) => {
+          const text = update.content.find((item) => item.type === "text")?.text;
+          if (text) updates.push(text);
+        },
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(updates.every((output) => Buffer.byteLength(output) <= 20 * 1024)).toBeTrue();
+      expect(updates.some((output) => output.includes("line-2999"))).toBeTrue();
+      expect(updates.some((output) => output.includes("[stderr]\nwarning"))).toBeTrue();
+    } finally {
+      await runner.close();
+    }
   });
 
   test("exposes only active tools and reports their signatures", async () => {

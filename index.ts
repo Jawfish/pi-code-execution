@@ -22,6 +22,7 @@ import {
   saveContextCodeArtifacts,
 } from "./context.ts";
 import {
+  appendLiveOutputTail,
   assembleOutput,
   MAX_CODE_EXECUTION_OUTPUT_BYTES,
   truncateOutput,
@@ -122,6 +123,10 @@ export interface CodeExecutionSourceDetails extends CodeExecutionDetails {
 
 const UNAVAILABLE_ARTIFACT_OUTPUT =
   "Historical code source is unavailable. Do not retry this reference. Write and execute a fresh script instead.";
+const LIVE_STREAM_SEPARATOR_BYTES = Buffer.byteLength("\n[stderr]\n", "utf-8");
+const MAX_LIVE_STREAM_BYTES = Math.floor(
+  (MAX_CODE_EXECUTION_OUTPUT_BYTES - LIVE_STREAM_SEPARATOR_BYTES) / 2,
+);
 
 export const NESTED_TOOL_CALL_EVENT = "code_execution:tool_call";
 
@@ -274,7 +279,8 @@ export const createCodeExecutionTool = (
       code = freshCode;
       artifactId = await saveArtifact(code);
     }
-    let streamed = "";
+    let streamedStdout = "";
+    let streamedStderr = "";
     const timeoutSecs = input.timeout ?? DEFAULT_TIMEOUT_SECS;
     const runtimeDefinitions = createBridgedDefinitions(getDefinitions());
     const activeToolNames = new Set(
@@ -292,11 +298,16 @@ export const createCodeExecutionTool = (
     const result = await runner.run(
       code,
       (runSignal) => createHostFunctions(activeDefinitions, ctx, runSignal, preflight),
-      (line) => {
-        streamed += line;
+      ({ stream, text }) => {
+        if (stream === "stdout") {
+          streamedStdout = appendLiveOutputTail(streamedStdout, text, MAX_LIVE_STREAM_BYTES);
+        } else {
+          streamedStderr = appendLiveOutputTail(streamedStderr, text, MAX_LIVE_STREAM_BYTES);
+        }
+        const liveOutput = assembleOutput(streamedStdout, streamedStderr);
         onUpdate?.({
-          content: [{ text: truncateOutput(streamed), type: "text" }],
-          details: { artifactId, output: streamed },
+          content: [{ text: liveOutput, type: "text" }],
+          details: { artifactId, output: liveOutput },
         });
       },
       { cwd: ctx.cwd, signal, timeoutSecs, toolSignatures },
@@ -307,6 +318,7 @@ export const createCodeExecutionTool = (
       details: { artifactId, output },
     };
   },
+  executionMode: "sequential",
   label: "Code Execution",
   name: "code_execution",
   parameters,

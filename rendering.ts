@@ -44,7 +44,11 @@ export const renderOutputText = (
     return `\n${theme.fg("success", theme.bold("Done"))}${theme.fg("dim", " · no output")}`;
   }
   const lines = output.split("\n");
-  const visible = expanded ? lines : lines.slice(0, COLLAPSED_OUTPUT_LINES);
+  const visible = expanded
+    ? lines
+    : isPartial
+      ? lines.slice(-COLLAPSED_OUTPUT_LINES)
+      : lines.slice(0, COLLAPSED_OUTPUT_LINES);
   const color = isError ? "error" : "toolOutput";
   const headingColor = isError ? "error" : "toolTitle";
   const label = isError ? "Error" : "Output";
@@ -54,9 +58,15 @@ export const renderOutputText = (
   )}`;
   const rendered = visible.map((line) => theme.fg(color, line));
   if (visible.length < lines.length) {
-    rendered.push(
-      theme.fg("dim", `Showing ${visible.length} of ${lines.length} lines · expand to view`),
-    );
+    const hidden = lines.length - visible.length;
+    const notice = isPartial
+      ? `${hidden} earlier ${hidden === 1 ? "line" : "lines"} hidden · expand to view`
+      : `Showing ${visible.length} of ${lines.length} lines · expand to view`;
+    if (isPartial) {
+      rendered.unshift(theme.fg("dim", notice));
+    } else {
+      rendered.push(theme.fg("dim", notice));
+    }
   }
   return ["", heading, ...rendered].join("\n");
 };

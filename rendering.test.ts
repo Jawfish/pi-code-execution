@@ -54,14 +54,23 @@ describe("code execution rendering", () => {
     );
   });
 
-  test("collapses long output unless expanded", () => {
-    const output = Array.from(
-      { length: COLLAPSED_OUTPUT_LINES + 1 },
-      (_, index) => `line ${index}`,
-    ).join("\n");
-    expect(renderOutputText(output, false, theme)).toContain(
-      `Showing ${COLLAPSED_OUTPUT_LINES} of ${COLLAPSED_OUTPUT_LINES + 1} lines · expand to view`,
+  test("collapses final output from the head and live output from the tail", () => {
+    const lineTotal = COLLAPSED_OUTPUT_LINES + 2;
+    const output = Array.from({ length: lineTotal }, (_, index) => `line ${index}`).join("\n");
+    const finalOutput = renderOutputText(output, false, theme);
+    expect(finalOutput).toContain(
+      `Showing ${COLLAPSED_OUTPUT_LINES} of ${lineTotal} lines · expand to view`,
     );
-    expect(renderOutputText(output, true, theme)).toContain(`line ${COLLAPSED_OUTPUT_LINES}`);
+    expect(finalOutput).toContain("line 0");
+    expect(finalOutput).not.toContain(`line ${lineTotal - 1}`);
+
+    const liveOutput = renderOutputText(output, false, theme, false, true);
+    expect(liveOutput).toContain(
+      `${lineTotal - COLLAPSED_OUTPUT_LINES} earlier lines hidden · expand to view`,
+    );
+    expect(liveOutput).not.toContain("<toolOutput>line 0</toolOutput>");
+    expect(liveOutput).toContain(`line ${lineTotal - 1}`);
+
+    expect(renderOutputText(output, true, theme)).toContain(`line ${lineTotal - 1}`);
   });
 });

@@ -28,7 +28,11 @@ pi --no-extensions -e .
 - Resolves relative paths and local imports from the Pi session directory.
 - Installs script dependencies declared with
   [PEP 723](https://peps.python.org/pep-0723/) through `uv`.
-- Streams output while the script runs and bounds retained stdout and stderr.
+- Streams stdout and stderr while the script runs and bounds retained output.
+- Runs sequentially with sibling calls in the same Pi tool batch, so they cannot
+  race with the script's filesystem or subprocess work.
+- Keeps explicit concurrency inside one script: bridged calls passed to
+  `asyncio.gather()` may still run at the same time.
 - Applies a configurable deadline to dependency installation, Python, and
   bridged tool calls.
 - Stores older script sources as verified content-addressed artifacts, then

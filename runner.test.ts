@@ -90,12 +90,23 @@ describe("SandboxRunner", () => {
     expect(stdout).toBe("node-runtime\n");
   });
 
-  test("streams stdout as the script prints", async () => {
+  test("streams stdout and stderr with channel identities", async () => {
     await withRunner(async (runner) => {
-      const streamed: string[] = [];
-      const result = await runner.run("print('hello')", {}, (line) => streamed.push(line));
-      expect(result).toEqual({ stdout: "hello\n" });
-      expect(streamed.join("")).toBe("hello\n");
+      const streamed: Array<{ stream: string; text: string }> = [];
+      const result = await runner.run(
+        [
+          "import sys",
+          "print('hello', flush=True)",
+          "print('warning', file=sys.stderr, flush=True)",
+        ].join("\n"),
+        {},
+        (chunk) => streamed.push(chunk),
+      );
+      expect(result).toEqual({ stderr: "warning\n", stdout: "hello\n" });
+      expect(streamed.filter(({ stream }) => stream === "stdout").map(({ text }) => text).join(""))
+        .toBe("hello\n");
+      expect(streamed.filter(({ stream }) => stream === "stderr").map(({ text }) => text).join(""))
+        .toBe("warning\n");
     });
   });
 
@@ -274,6 +285,21 @@ describe("SandboxRunner", () => {
       } finally {
         await rm(directory, { force: true, recursive: true });
       }
+    });
+  });
+
+  test("lets ordinary scripts manage their own event loop", async () => {
+    await withRunner(async (runner) => {
+      const result = await runner.run(
+        [
+          "import asyncio",
+          "async def main():",
+          "    await asyncio.sleep(0.01)",
+          "    return 'managed'",
+          "print(asyncio.run(main()))",
+        ].join("\n"),
+      );
+      expect(result.stdout).toBe("managed\n");
     });
   });
 
@@ -556,15 +582,21 @@ describe("SandboxRunner", () => {
     }
   });
 
-  test("stops the script when the output callback fails", async () => {
+  test("stops the script when either channel callback fails", async () => {
     await withRunner(async (runner) => {
-      const started = Date.now();
-      await expect(
-        runner.run("import time\nprint('ready', flush=True)\ntime.sleep(30)", {}, () => {
-          throw new Error("output consumer failed");
-        }),
-      ).rejects.toThrow("output consumer failed");
-      expect(Date.now() - started).toBeLessThan(3000);
+      for (const stream of ["stdout", "stderr"] as const) {
+        const print =
+          stream === "stdout"
+            ? "print('ready', flush=True)"
+            : "print('ready', file=sys.stderr, flush=True)";
+        const started = Date.now();
+        await expect(
+          runner.run(`import sys, time\n${print}\ntime.sleep(30)`, {}, (chunk) => {
+            if (chunk.stream === stream) throw new Error(`${stream} consumer failed`);
+          }),
+        ).rejects.toThrow(`${stream} consumer failed`);
+        expect(Date.now() - started).toBeLessThan(3000);
+      }
     });
   });
 

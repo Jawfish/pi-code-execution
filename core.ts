@@ -3,6 +3,16 @@ import { truncateHead } from "@earendil-works/pi-coding-agent";
 export const MAX_CODE_EXECUTION_OUTPUT_BYTES = 20 * 1024;
 export const NO_OUTPUT = "(no output)";
 
+/** Keep a UTF-8-safe rolling tail for bounded live rendering. */
+export const appendLiveOutputTail = (current: string, chunk: string, maxBytes: number): string => {
+  const combined = Buffer.from(current + chunk);
+  if (combined.length <= maxBytes) return current + chunk;
+  return combined
+    .subarray(combined.length - Math.max(0, maxBytes))
+    .toString("utf-8")
+    .replace(/^\uFFFD+/u, "");
+};
+
 /**
  * CPython scripts communicate through stdout. Successful stderr is retained
  * too: libraries and subprocesses commonly use it for warnings and progress,

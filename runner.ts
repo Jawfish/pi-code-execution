@@ -55,6 +55,13 @@ export interface RunResult {
   stdoutTruncated?: boolean;
 }
 
+export interface OutputChunk {
+  stream: "stderr" | "stdout";
+  text: string;
+}
+
+export type OutputCallback = (chunk: OutputChunk) => void;
+
 /** Agent tools, keyed by the name Python calls them by. */
 export type HostFunctions = Record<
   string,
@@ -386,13 +393,17 @@ interface CappedStream {
 const readCappedStream = async (
   stream: NodeJS.ReadableStream,
   maxBytes: number,
+  onOutput?: (text: string) => void,
 ): Promise<CappedStream> => {
   const limit = Math.max(0, maxBytes);
+  const decoder = new TextDecoder();
   let captured: Buffer = Buffer.alloc(0);
   let bytes = 0;
   for await (const chunk of stream) {
     const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     bytes += data.length;
+    const decoded = decoder.decode(data, { stream: true });
+    if (decoded) onOutput?.(decoded);
     if (limit === 0) continue;
     if (data.length >= limit) {
       captured = data.subarray(data.length - limit);
@@ -403,6 +414,8 @@ const readCappedStream = async (
       captured = captured.subarray(captured.length - limit);
     }
   }
+  const finalText = decoder.decode();
+  if (finalText) onOutput?.(finalText);
   const truncated = captured.length < bytes;
   const text = captured.toString("utf-8").replace(/^\uFFFD/u, "");
   return { bytes, text, truncated };
@@ -428,7 +441,7 @@ export class SandboxRunner {
   run(
     code: string,
     tools: HostFunctionsInput = {},
-    onOutput?: (line: string) => void,
+    onOutput?: OutputCallback,
     options: RunnerOptions = {},
   ): Promise<RunResult> {
     if (this.closed) {
@@ -447,7 +460,7 @@ export class SandboxRunner {
   private async execute(
     code: string,
     toolsInput: HostFunctionsInput,
-    onOutput: ((line: string) => void) | undefined,
+    onOutput: OutputCallback | undefined,
     options: RunnerOptions,
     controller: AbortController,
   ): Promise<RunResult> {
@@ -533,16 +546,16 @@ export class SandboxRunner {
           const remaining = maxStdoutBytes - Buffer.byteLength(stdout, "utf-8");
           if (remaining <= 0) {
             stdoutTruncated = true;
-            continue;
+          } else {
+            const accepted = Buffer.from(text)
+              .subarray(0, remaining)
+              .toString("utf-8")
+              .replace(/\uFFFD$/u, "");
+            stdout += accepted;
+            stdoutTruncated ||=
+              Buffer.byteLength(accepted, "utf-8") < Buffer.byteLength(text, "utf-8");
           }
-          const accepted = Buffer.from(text)
-            .subarray(0, remaining)
-            .toString("utf-8")
-            .replace(/\uFFFD$/u, "");
-          stdout += accepted;
-          stdoutTruncated ||=
-            Buffer.byteLength(accepted, "utf-8") < Buffer.byteLength(text, "utf-8");
-          if (accepted) onOutput?.(accepted);
+          onOutput?.({ stream: "stdout", text });
         }
         const finalText = decoder.decode();
         if (finalText) {
@@ -555,14 +568,16 @@ export class SandboxRunner {
           stdout += accepted;
           stdoutTruncated ||=
             Buffer.byteLength(accepted, "utf-8") < Buffer.byteLength(finalText, "utf-8");
-          if (accepted) onOutput?.(accepted);
+          onOutput?.({ stream: "stdout", text: finalText });
         }
       };
       let stderr = "";
       let stderrBytes = 0;
       let stderrTruncated = false;
       const collectStderr = async (): Promise<void> => {
-        const captured = await readCappedStream(child.stderr, maxStderrBytes);
+        const captured = await readCappedStream(child.stderr, maxStderrBytes, (text) =>
+          onOutput?.({ stream: "stderr", text }),
+        );
         ({ bytes: stderrBytes, text: stderr, truncated: stderrTruncated } = captured);
       };
       let streamError: unknown;
