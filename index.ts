@@ -16,6 +16,7 @@ import {
 } from "./artifacts.ts";
 import type { CodeArtifactReference, LoadedCodeArtifact } from "./artifacts.ts";
 import {
+  codeSourceReference,
   isRedactedCodePlaceholder,
   parseCodeArtifactReference,
   redactCompletedCodeExecutions,
@@ -25,6 +26,7 @@ import {
   appendLiveOutputTail,
   assembleOutput,
   MAX_CODE_EXECUTION_OUTPUT_BYTES,
+  truncateFailureOutput,
   truncateOutput,
 } from "./core.ts";
 import {
@@ -39,6 +41,7 @@ import {
 import type { AnyToolDefinition, NestedToolCallPreflight } from "./host.ts";
 import { renderOutputText, renderScriptText } from "./rendering.ts";
 import { DEFAULT_TIMEOUT_SECS, SandboxRunner } from "./runner.ts";
+import type { RunResult, RunStatus } from "./runner.ts";
 
 const sourceReferenceParameters = Type.Object(
   {
@@ -108,14 +111,39 @@ const sourceParameters = Type.Object(
 export type CodeExecutionInput = Static<typeof parameters>;
 export type CodeExecutionSourceInput = Static<typeof sourceParameters>;
 
-export interface CodeExecutionDetails {
+export type NestedToolCallRecord = Record<string, unknown>;
+
+export interface OutputArtifactReference {
   artifactId: string;
-  output: string;
+  sha256: string;
 }
 
-export interface CodeExecutionSourceDetails extends CodeExecutionDetails {
+export interface CodeExecutionFinalDetails {
+  durationMs: number;
+  exitCode?: number;
+  nestedCalls: NestedToolCallRecord[];
+  outputRef?: OutputArtifactReference;
+  signal?: string;
+  sourceRef: CodeArtifactReference;
+  status: RunStatus;
+  stderrBytes: number;
+  stderrTruncated: boolean;
+  stdoutBytes: number;
+  stdoutTruncated: boolean;
+}
+
+export interface CodeExecutionRunningDetails {
+  sourceRef: CodeArtifactReference;
+  status: "running";
+}
+
+export type CodeExecutionDetails = CodeExecutionFinalDetails | CodeExecutionRunningDetails;
+
+export interface CodeExecutionSourceDetails {
+  artifactId: string;
   nextOffset?: number;
   offset: number;
+  output: string;
   source?: string;
   totalBytes?: number;
   totalLines: number;
@@ -228,6 +256,75 @@ Saved sources
 
 Environment: runs with your full privileges in the session working directory (relative paths resolve there) with network access, as a fresh process each call with no state persisting between runs. Default deadline is 30 seconds (maximum 300), covering dependency installation and tool calls.`;
 
+const finalDetails = (
+  result: RunResult,
+  sourceRef: CodeArtifactReference,
+): CodeExecutionFinalDetails => ({
+  durationMs: result.durationMs,
+  ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
+  nestedCalls: [],
+  ...(result.signal === undefined ? {} : { signal: result.signal }),
+  sourceRef,
+  status: result.status,
+  stderrBytes: result.stderrBytes,
+  stderrTruncated: result.stderrTruncated,
+  stdoutBytes: result.stdoutBytes,
+  stdoutTruncated: result.stdoutTruncated,
+});
+
+const failureDiagnostics = (result: RunResult): string => {
+  const stderr = result.stderr?.trim();
+  const diagnostic = result.diagnostic?.trim();
+  if (!diagnostic) return stderr ?? `code execution ended with ${result.status}`;
+  if (!stderr || diagnostic.includes(stderr)) return diagnostic;
+  return `${stderr}\n\n${diagnostic}`;
+};
+
+const finalOutput = (result: RunResult): string => {
+  if (result.status === "success") {
+    return truncateOutput(assembleOutput(result.stdout, result.stderr));
+  }
+  return truncateFailureOutput(assembleOutput(result.stdout, failureDiagnostics(result)));
+};
+
+const unavailableDetails = (
+  sourceRef: CodeArtifactReference,
+  startedAt: number,
+): CodeExecutionFinalDetails => ({
+  durationMs: performance.now() - startedAt,
+  nestedCalls: [],
+  sourceRef,
+  status: "setup_error",
+  stderrBytes: 0,
+  stderrTruncated: false,
+  stdoutBytes: 0,
+  stdoutTruncated: false,
+});
+
+const ERROR_STATUSES = new Set<RunStatus>([
+  "cancelled",
+  "policy_error",
+  "runtime_error",
+  "setup_error",
+  "timeout",
+]);
+
+export const codeExecutionResultOverride = (
+  toolName: string,
+  details: unknown,
+): { isError: true } | undefined => {
+  if (
+    toolName !== "code_execution" ||
+    typeof details !== "object" ||
+    details === null ||
+    !("status" in details) ||
+    !ERROR_STATUSES.has(details.status as RunStatus)
+  ) {
+    return undefined;
+  }
+  return { isError: true };
+};
+
 export const createCodeExecutionTool = (
   runner: SandboxRunner,
   saveArtifact: (code: string) => Promise<string> = saveCodeArtifact,
@@ -239,7 +336,8 @@ export const createCodeExecutionTool = (
   getDefinitions: () => AnyToolDefinition[] = () => [],
 ): ToolDefinition<typeof parameters, CodeExecutionDetails> => ({
   description: BASE_DESCRIPTION,
-  async execute(_toolCallId, input, signal, onUpdate, ctx) {
+  async execute(toolCallId, input, signal, onUpdate, ctx) {
+    const startedAt = performance.now();
     const hasCode = input.code !== undefined;
     const hasSourceRef = input.sourceRef !== undefined;
     if (hasCode === hasSourceRef) {
@@ -254,12 +352,10 @@ export const createCodeExecutionTool = (
     if (reference) {
       const artifact = await resolveArtifactSource(reference, ctx, saveArtifact, loadArtifact);
       if (!artifact) {
+        const sourceRef = { ...reference, toolCallId };
         return {
           content: [{ text: UNAVAILABLE_ARTIFACT_OUTPUT, type: "text" }],
-          details: {
-            artifactId: reference.artifactId,
-            output: UNAVAILABLE_ARTIFACT_OUTPUT,
-          },
+          details: unavailableDetails(sourceRef, startedAt),
         };
       }
       ({ artifactId, code } = artifact);
@@ -279,6 +375,7 @@ export const createCodeExecutionTool = (
       code = freshCode;
       artifactId = await saveArtifact(code);
     }
+    const sourceRef = { ...codeSourceReference(code, toolCallId), artifactId };
     let streamedStdout = "";
     let streamedStderr = "";
     const timeoutSecs = input.timeout ?? DEFAULT_TIMEOUT_SECS;
@@ -307,15 +404,15 @@ export const createCodeExecutionTool = (
         const liveOutput = assembleOutput(streamedStdout, streamedStderr);
         onUpdate?.({
           content: [{ text: liveOutput, type: "text" }],
-          details: { artifactId, output: liveOutput },
+          details: { sourceRef, status: "running" },
         });
       },
       { cwd: ctx.cwd, signal, timeoutSecs, toolSignatures },
     );
-    const output = truncateOutput(assembleOutput(result.stdout, result.stderr));
+    const output = finalOutput(result);
     return {
       content: [{ text: output, type: "text" }],
-      details: { artifactId, output },
+      details: finalDetails(result, sourceRef),
     };
   },
   executionMode: "sequential",
@@ -358,7 +455,14 @@ export const createCodeExecutionTool = (
       .map((item) => item.text)
       .join("\n");
     return new Text(
-      renderOutputText(text, options.expanded, theme, context.isError, options.isPartial),
+      renderOutputText(
+        text,
+        options.expanded,
+        theme,
+        context.isError,
+        options.isPartial,
+        result.details.status,
+      ),
       0,
       0,
     );
@@ -499,6 +603,7 @@ export default function codeExecutionExtension(pi: ExtensionAPI): void {
     ),
   );
   pi.registerTool(createCodeExecutionSourceTool(saveCodeArtifact, loadCodeArtifact));
+  pi.on("tool_result", (event) => codeExecutionResultOverride(event.toolName, event.details));
   pi.on("context", async (event) => {
     await saveContextCodeArtifacts(event.messages);
     return { messages: redactCompletedCodeExecutions(event.messages) };

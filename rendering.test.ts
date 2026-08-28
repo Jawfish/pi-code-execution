@@ -36,7 +36,7 @@ describe("code execution rendering", () => {
     expect(expanded).not.toContain("expand to view");
   });
 
-  test("shows hierarchy, status, and explicit success or error labels", () => {
+  test("shows hierarchy and fallback output labels", () => {
     expect(renderScriptText("print('hi')", false, theme, true)).toContain(
       "<dim> · 1 line · running</dim>",
     );
@@ -49,8 +49,28 @@ describe("code execution rendering", () => {
     expect(renderOutputText("boom", false, theme, true)).toBe(
       "\n<error><bold>Error</bold></error><dim> · 1 line</dim>\n<error>boom</error>",
     );
-    expect(renderOutputText("working", false, theme, false, true)).toContain(
+    expect(renderOutputText("working", false, theme, false, true, "running")).toContain(
       "<dim> · 1 line · live</dim>",
+    );
+  });
+
+  test("renders every final status without inspecting output text", () => {
+    expect(renderOutputText("done", false, theme, false, false, "success")).toContain(
+      "<success><bold>Success</bold></success>",
+    );
+    expect(renderOutputText(NO_OUTPUT, false, theme, false, false, "success")).toBe(
+      "\n<success><bold>Success</bold></success><dim> · no output</dim>",
+    );
+    for (const status of ["policy_error", "runtime_error", "setup_error"] as const) {
+      expect(renderOutputText("opaque", false, theme, false, false, status)).toContain(
+        "<error><bold>Error</bold></error>",
+      );
+    }
+    expect(renderOutputText("opaque", false, theme, false, false, "timeout")).toContain(
+      "<warning><bold>Timed out</bold></warning>",
+    );
+    expect(renderOutputText("opaque", false, theme, false, false, "cancelled")).toContain(
+      "<warning><bold>Cancelled</bold></warning>",
     );
   });
 

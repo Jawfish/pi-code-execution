@@ -182,6 +182,13 @@ def _install_tools():
     }
 
 
+def _mark_setup_complete():
+    marker = os.environ.pop("PI_SETUP_MARKER", "")
+    if marker:
+        with open(marker, "xb") as handle:
+            handle.write(b"ready")
+
+
 def _main(path):
     with open(path, "r", encoding="utf-8") as handle:
         source = handle.read()
@@ -219,6 +226,7 @@ def _report(exc):
 def _run():
     _start_watchdog()
     _install_tools()
+    _mark_setup_complete()
     try:
         _main(sys.argv[1])
     except SystemExit:

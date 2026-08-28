@@ -23,10 +23,10 @@ const toolCall = (id: string, name: string, code: string) => ({
 
 const assistant = (...content: unknown[]) => ({ content, role: "assistant" });
 
-const result = (id: string, details?: unknown) => ({
+const result = (id: string, details?: unknown, isError = false) => ({
   content: [{ text: `result ${id}`, type: "text" }],
   details,
-  isError: false,
+  isError,
   role: "toolResult",
   timestamp: 1,
   toolCallId: id,
@@ -76,6 +76,57 @@ describe("code execution context redaction", () => {
     });
     expect(redacted[3]?.role === "toolResult" && redacted[3].details).toEqual({
       output: "latest",
+    });
+  });
+
+  test("preserves structured details while redacting every final status", () => {
+    const statuses = [
+      "success",
+      "runtime_error",
+      "setup_error",
+      "timeout",
+      "cancelled",
+      "policy_error",
+    ] as const;
+    const original = messages([
+      ...statuses.flatMap((status) => {
+        const id = `call-${status}`;
+        const code = `print('${status}')`;
+        const details = {
+          durationMs: 10,
+          exitCode: status === "success" ? 0 : 1,
+          nestedCalls: [],
+          sourceRef: codeSourceReference(code, id),
+          status,
+          stderrBytes: 0,
+          stderrTruncated: false,
+          stdoutBytes: 0,
+          stdoutTruncated: false,
+        };
+        return [
+          assistant(toolCall(id, "code_execution", code)),
+          result(id, details, status !== "success"),
+        ];
+      }),
+      assistant(toolCall("latest", "code_execution", "print('latest')")),
+    ]);
+
+    const redacted = redactCompletedCodeExecutions(original);
+
+    statuses.forEach((status, index) => {
+      const messageIndex = index * 2;
+      const id = `call-${status}`;
+      expect(argumentsAt(redacted, messageIndex)).toEqual({
+        sourceRef: codeSourceReference(`print('${status}')`, id),
+      });
+      const toolResult = redacted[messageIndex + 1];
+      expect(toolResult?.role === "toolResult" && toolResult.details).toMatchObject({
+        sourceRef: codeSourceReference(`print('${status}')`, id),
+        status,
+      });
+      expect(toolResult?.role === "toolResult" && toolResult.isError).toBe(
+        status !== "success",
+      );
     });
   });
 

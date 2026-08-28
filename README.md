@@ -73,7 +73,55 @@ source without running it. The reader supports `offset` and `limit` for long
 scripts and caps each source chunk at 20 KiB.
 
 Legacy path-bearing and XML-like references remain readable for resumed
-sessions. New references contain no machine-specific absolute path.
+sessions. New references contain no machine-specific absolute path. A final
+execution result rebuilds the reference from the exact loaded source, keeps the
+verified artifact ID, and records the current outer tool-call ID.
+
+## Execution outcomes
+
+Completed expected runs return structured details instead of throwing away
+process state:
+
+```typescript
+type CodeExecutionFinalDetails = {
+  status:
+    | "success"
+    | "runtime_error"
+    | "setup_error"
+    | "timeout"
+    | "cancelled"
+    | "policy_error";
+  exitCode?: number;
+  signal?: string;
+  durationMs: number;
+  stdoutBytes: number;
+  stderrBytes: number;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  sourceRef: CodeArtifactReference;
+  outputRef?: OutputArtifactReference;
+  nestedCalls: NestedToolCallRecord[];
+};
+```
+
+`runtime_error` means CPython reached the user-code milestone and then failed.
+`setup_error` covers failures before that milestone, including `uv`, dependency,
+working-directory, and unavailable-source failures. The other statuses identify
+deadlines, caller cancellation, and blocked nested calls directly.
+
+While a script is running, partial updates use a smaller shape:
+
+```typescript
+type CodeExecutionRunningDetails = {
+  status: "running";
+  sourceRef: CodeArtifactReference;
+};
+```
+
+Expected non-success results keep their details and retained output, then the
+extension marks them as Pi tool errors. Invalid inputs, corrupt artifacts,
+stream callback defects, and other internal extension errors still throw.
+`outputRef` is optional, and `nestedCalls` is empty until those records exist.
 
 ## Tool bridge
 
