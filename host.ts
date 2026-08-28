@@ -12,17 +12,260 @@ import type { HostFunctions } from "./runner.ts";
 export type AnyToolDefinition = ToolDefinition<TSchema, any, any>;
 
 export const MAX_RECOVERED_TOOL_OUTPUT_BYTES = 5 * 1024 * 1024;
+export const MAX_NESTED_TOOL_PREVIEW_BYTES = 4 * 1024;
 
-export interface NestedToolCall {
+export interface NestedToolCallIdentity {
+  childToolCallId: string;
+  parentToolCallId: string;
+  pythonName: string;
+  registeredName: string;
+}
+
+export interface NestedToolCall extends NestedToolCallIdentity {
   cwd: string;
   input: Record<string, unknown>;
+  signal?: AbortSignal;
+  startedAt: string;
+  /** Legacy alias for the registered Pi tool name. */
   toolName: string;
 }
 
 export type NestedToolCallPreflight = (event: NestedToolCall) => void | Promise<void>;
 
+export type NestedToolCallStatus =
+  | "blocked"
+  | "cancelled"
+  | "failed"
+  | "success"
+  | "validation_error";
+
+export interface NestedToolCallOutcome extends NestedToolCall {
+  durationMs: number;
+  error?: unknown;
+  output?: string;
+  result?: unknown;
+  status: NestedToolCallStatus;
+}
+
+export interface NestedToolCallPreview {
+  bytes: number;
+  text: string;
+  truncated: boolean;
+}
+
+export interface NestedToolUsage {
+  cacheRead: number;
+  cacheWrite: number;
+  cacheWrite1h?: number;
+  cost: {
+    cacheRead: number;
+    cacheWrite: number;
+    input: number;
+    output: number;
+    total: number;
+  };
+  input: number;
+  output: number;
+  reasoning?: number;
+  totalTokens: number;
+}
+
+export interface NestedToolCallStartRecord extends NestedToolCallIdentity {
+  inputPreview: NestedToolCallPreview;
+  startedAt: string;
+}
+
+export interface NestedToolCallRecord extends NestedToolCallIdentity {
+  durationMs: number;
+  errorPreview?: NestedToolCallPreview;
+  inputPreview: NestedToolCallPreview;
+  resultPreview?: NestedToolCallPreview;
+  startedAt: string;
+  status: NestedToolCallStatus;
+  usage?: NestedToolUsage;
+}
+
+export type NestedToolBeforeHandler = (event: NestedToolCall) => void | Promise<void>;
+export type NestedToolAfterHandler = (event: NestedToolCallOutcome) => void | Promise<void>;
+export type NestedToolDispatchResult = Awaited<
+  ReturnType<AnyToolDefinition["execute"]>
+>;
+export type NestedToolDispatcher = (
+  event: NestedToolCall,
+  definition: AnyToolDefinition,
+  ctx: ExtensionContext,
+) => NestedToolDispatchResult | Promise<NestedToolDispatchResult>;
+
+export interface NestedToolRegistration {
+  after?: NestedToolAfterHandler;
+  before?: NestedToolBeforeHandler;
+  definition: AnyToolDefinition;
+  dispatch?: NestedToolDispatcher;
+}
+
+export type NestedToolRegistrationInput = AnyToolDefinition | NestedToolRegistration;
+
+export interface PythonToolRegistration extends NestedToolRegistration {
+  pythonName: string;
+  registeredName: string;
+}
+
+export interface HostFunctionIdentityOptions {
+  onCall?: (identity: NestedToolCallIdentity) => void;
+  onOutcome?: (outcome: NestedToolCallOutcome) => void;
+  onStart?: (started: NestedToolCallStartRecord) => void;
+  parentToolCallId?: string;
+}
+
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const utf8Preview = (
+  text: string,
+  maxBytes = MAX_NESTED_TOOL_PREVIEW_BYTES,
+): NestedToolCallPreview => {
+  const bytes = Buffer.from(text, "utf-8");
+  if (bytes.length <= maxBytes) {
+    return { bytes: bytes.length, text, truncated: false };
+  }
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] ?? 0) >= 0x80 && (bytes[end] ?? 0) <= 0xbf) {
+    end -= 1;
+  }
+  return {
+    bytes: bytes.length,
+    text: bytes.subarray(0, end).toString("utf-8"),
+    truncated: true,
+  };
+};
+
+const jsonPreview = (value: unknown): NestedToolCallPreview => {
+  let text: string;
+  try {
+    text = JSON.stringify(value) ?? String(value);
+  } catch (error) {
+    text = `[input could not be serialized: ${error instanceof Error ? error.message : String(error)}]`;
+  }
+  return utf8Preview(text);
+};
+
+const errorPreview = (error: unknown): NestedToolCallPreview =>
+  utf8Preview(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
+
+const finiteNumber = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+const nestedUsage = (result: unknown): NestedToolUsage | undefined => {
+  if (!isObject(result) || !isObject(result.usage) || !isObject(result.usage.cost)) {
+    return undefined;
+  }
+  const usage = result.usage;
+  const cost = usage.cost as Record<string, unknown>;
+  if (
+    !finiteNumber(usage.input) ||
+    !finiteNumber(usage.output) ||
+    !finiteNumber(usage.cacheRead) ||
+    !finiteNumber(usage.cacheWrite) ||
+    !finiteNumber(usage.totalTokens) ||
+    (usage.cacheWrite1h !== undefined && !finiteNumber(usage.cacheWrite1h)) ||
+    (usage.reasoning !== undefined && !finiteNumber(usage.reasoning)) ||
+    !finiteNumber(cost.input) ||
+    !finiteNumber(cost.output) ||
+    !finiteNumber(cost.cacheRead) ||
+    !finiteNumber(cost.cacheWrite) ||
+    !finiteNumber(cost.total)
+  ) {
+    return undefined;
+  }
+  return {
+    cacheRead: usage.cacheRead,
+    cacheWrite: usage.cacheWrite,
+    ...(usage.cacheWrite1h === undefined ? {} : { cacheWrite1h: usage.cacheWrite1h }),
+    cost: {
+      cacheRead: cost.cacheRead,
+      cacheWrite: cost.cacheWrite,
+      input: cost.input,
+      output: cost.output,
+      total: cost.total,
+    },
+    input: usage.input,
+    output: usage.output,
+    ...(usage.reasoning === undefined ? {} : { reasoning: usage.reasoning }),
+    totalTokens: usage.totalTokens,
+  };
+};
+
+export const createNestedToolCallStartRecord = (
+  call: NestedToolCall,
+): NestedToolCallStartRecord => ({
+  childToolCallId: call.childToolCallId,
+  inputPreview: jsonPreview(call.input),
+  parentToolCallId: call.parentToolCallId,
+  pythonName: call.pythonName,
+  registeredName: call.registeredName,
+  startedAt: call.startedAt,
+});
+
+export const createNestedToolCallRecord = (
+  outcome: NestedToolCallOutcome,
+): NestedToolCallRecord => {
+  const usage = nestedUsage(outcome.result);
+  return {
+    childToolCallId: outcome.childToolCallId,
+    durationMs: outcome.durationMs,
+    ...(outcome.error === undefined ? {} : { errorPreview: errorPreview(outcome.error) }),
+    inputPreview: jsonPreview(outcome.input),
+    parentToolCallId: outcome.parentToolCallId,
+    pythonName: outcome.pythonName,
+    registeredName: outcome.registeredName,
+    ...(outcome.output === undefined ? {} : { resultPreview: utf8Preview(outcome.output) }),
+    startedAt: outcome.startedAt,
+    status: outcome.status,
+    ...(usage ? { usage } : {}),
+  };
+};
+
+export const aggregateNestedToolUsage = (
+  records: NestedToolCallRecord[],
+): NestedToolUsage | undefined => {
+  const usages = records.flatMap(({ usage }) => (usage ? [usage] : []));
+  if (usages.length === 0) return undefined;
+  const cacheWrite1h = usages.some((usage) => usage.cacheWrite1h !== undefined)
+    ? usages.reduce((total, usage) => total + (usage.cacheWrite1h ?? 0), 0)
+    : undefined;
+  const reasoning = usages.some((usage) => usage.reasoning !== undefined)
+    ? usages.reduce((total, usage) => total + (usage.reasoning ?? 0), 0)
+    : undefined;
+  const total = usages.reduce<NestedToolUsage>(
+    (total, usage) => ({
+      cacheRead: total.cacheRead + usage.cacheRead,
+      cacheWrite: total.cacheWrite + usage.cacheWrite,
+      cost: {
+        cacheRead: total.cost.cacheRead + usage.cost.cacheRead,
+        cacheWrite: total.cost.cacheWrite + usage.cost.cacheWrite,
+        input: total.cost.input + usage.cost.input,
+        output: total.cost.output + usage.cost.output,
+        total: total.cost.total + usage.cost.total,
+      },
+      input: total.input + usage.input,
+      output: total.output + usage.output,
+      totalTokens: total.totalTokens + usage.totalTokens,
+    }),
+    {
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: { cacheRead: 0, cacheWrite: 0, input: 0, output: 0, total: 0 },
+      input: 0,
+      output: 0,
+      totalTokens: 0,
+    },
+  );
+  return {
+    ...total,
+    ...(cacheWrite1h === undefined ? {} : { cacheWrite1h }),
+    ...(reasoning === undefined ? {} : { reasoning }),
+  };
+};
 
 const flattenedContent = (result: { content?: { type: string; text?: string }[] }): string =>
   (result.content ?? [])
@@ -320,20 +563,43 @@ const pythonToolName = (name: string): string => {
   return result;
 };
 
-export const createPythonDefinitions = (definitions: AnyToolDefinition[]): AnyToolDefinition[] => {
+const isNestedToolRegistration = (
+  value: NestedToolRegistrationInput,
+): value is NestedToolRegistration => "definition" in value;
+
+const normalizeNestedRegistration = (
+  value: NestedToolRegistrationInput,
+): NestedToolRegistration =>
+  isNestedToolRegistration(value) ? value : { definition: value };
+
+export const createPythonRegistrations = (
+  registrations: NestedToolRegistrationInput[],
+): PythonToolRegistration[] => {
   const used = new Set<string>();
-  return definitions.map((definition) => {
+  return registrations.map((item) => {
+    const registration = normalizeNestedRegistration(item);
+    const { definition } = registration;
     const base = pythonToolName(definition.name);
-    let name = base;
+    let pythonName = base;
     let suffix = 2;
-    while (used.has(name)) {
-      name = `${base}_${suffix}`;
+    while (used.has(pythonName)) {
+      pythonName = `${base}_${suffix}`;
       suffix += 1;
     }
-    used.add(name);
-    return name === definition.name ? definition : { ...definition, name };
+    used.add(pythonName);
+    return {
+      ...registration,
+      pythonName,
+      registeredName: definition.name,
+    };
   });
 };
+
+/** Backward-compatible view for integrations that only need Python-safe definitions. */
+export const createPythonDefinitions = (definitions: AnyToolDefinition[]): AnyToolDefinition[] =>
+  createPythonRegistrations(definitions).map(({ definition, pythonName }) =>
+    pythonName === definition.name ? definition : { ...definition, name: pythonName },
+  );
 
 export const renderToolSignature = (
   tool: Pick<AnyToolDefinition, "name" | "parameters">,
@@ -361,13 +627,27 @@ export const CODE_EXECUTION_COLLECT_TOOLS_EVENT = "code_execution:collect_tools"
 export interface CodeExecutionToolCollection {
   add: (...definitions: AnyToolDefinition[]) => void;
   definitions: AnyToolDefinition[];
+  register: (
+    definition: AnyToolDefinition,
+    handlers?: Omit<NestedToolRegistration, "definition">,
+  ) => void;
+  registrations: NestedToolRegistration[];
 }
 
 export const createToolCollection = (): CodeExecutionToolCollection => {
   const definitions: AnyToolDefinition[] = [];
+  const registrations: NestedToolRegistration[] = [];
+  const register: CodeExecutionToolCollection["register"] = (definition, handlers = {}) => {
+    definitions.push(definition);
+    registrations.push({ ...handlers, definition });
+  };
   return {
-    add: (...items) => definitions.push(...items),
+    add: (...items) => {
+      for (const definition of items) register(definition);
+    },
     definitions,
+    register,
+    registrations,
   };
 };
 
@@ -376,16 +656,21 @@ export const createToolCollection = (): CodeExecutionToolCollection => {
  * extensions may opt definitions into the bridge through the shared event.
  * Local filesystem and shell work should stay in the Python standard library.
  */
-export const createBridgedDefinitions = (
-  additional: AnyToolDefinition[] = [],
-): AnyToolDefinition[] => {
+export const createBridgedRegistrations = (
+  additional: NestedToolRegistrationInput[] = [],
+): NestedToolRegistration[] => {
   const seen = new Set<string>();
-  return additional.filter((definition) => {
+  return additional.map(normalizeNestedRegistration).filter(({ definition }) => {
     if (seen.has(definition.name)) return false;
     seen.add(definition.name);
     return true;
   });
 };
+
+export const createBridgedDefinitions = (
+  additional: AnyToolDefinition[] = [],
+): AnyToolDefinition[] =>
+  createBridgedRegistrations(additional).map(({ definition }) => definition);
 
 const withAbort = async <T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> => {
   if (!signal) {
@@ -408,6 +693,7 @@ const withAbort = async <T>(promise: Promise<T>, signal?: AbortSignal): Promise<
 export const prepareAndValidateInput = (
   definition: AnyToolDefinition,
   input: Record<string, unknown>,
+  registeredName = definition.name,
 ): unknown => {
   const prepared = definition.prepareArguments ? definition.prepareArguments(input) : input;
   const schema = definition.parameters as TSchema & {
@@ -419,47 +705,151 @@ export const prepareAndValidateInput = (
     : [];
   if (unknown.length > 0) {
     throw new TypeError(
-      `Invalid arguments for ${definition.name}: unknown ${unknown.length === 1 ? "property" : "properties"} ${unknown.join(", ")}`,
+      `Invalid arguments for ${registeredName}: unknown ${unknown.length === 1 ? "property" : "properties"} ${unknown.join(", ")}`,
     );
   }
   if (!Check(schema, prepared)) {
     const messages = [...Errors(schema, prepared)].map((error) => error.message);
-    throw new TypeError(`Invalid arguments for ${definition.name}: ${messages.join("; ")}`);
+    throw new TypeError(`Invalid arguments for ${registeredName}: ${messages.join("; ")}`);
   }
   return prepared;
 };
 
+const isPythonToolRegistration = (
+  value: AnyToolDefinition | PythonToolRegistration,
+): value is PythonToolRegistration => "definition" in value && "pythonName" in value;
+
+const normalizeRegistration = (
+  value: AnyToolDefinition | PythonToolRegistration,
+): PythonToolRegistration => {
+  if (isPythonToolRegistration(value)) return value;
+  return {
+    definition: value,
+    pythonName: value.name,
+    registeredName: value.name,
+  };
+};
+
+const lifecycleStatus = (
+  error: unknown,
+  signal: AbortSignal | undefined,
+): Exclude<NestedToolCallStatus, "success"> => {
+  if (signal?.aborted) return "cancelled";
+  if (error instanceof NestedToolPolicyError) return "blocked";
+  return "failed";
+};
+
 export const createHostFunctions = (
-  definitions: AnyToolDefinition[],
+  definitions: Array<AnyToolDefinition | PythonToolRegistration>,
   ctx: ExtensionContext,
   signal?: AbortSignal,
   preflight?: NestedToolCallPreflight,
+  identityOptions: HostFunctionIdentityOptions = {},
 ): HostFunctions =>
   Object.fromEntries(
-    definitions.map((definition) => [
-      definition.name,
-      async (input: Record<string, unknown>) => {
-        signal?.throwIfAborted();
-        const prepared = prepareAndValidateInput(definition, input);
-        if (preflight) {
+    definitions.map((item) => {
+      const { after, before, definition, dispatch, pythonName, registeredName } =
+        normalizeRegistration(item);
+      return [
+        pythonName,
+        async (input: Record<string, unknown>) => {
+          const started = performance.now();
+          const startedAt = new Date().toISOString();
+          const identity: NestedToolCallIdentity = {
+            childToolCallId: crypto.randomUUID(),
+            parentToolCallId: identityOptions.parentToolCallId ?? "untracked-code-execution",
+            pythonName,
+            registeredName,
+          };
+          identityOptions.onCall?.(identity);
+          let call: NestedToolCall = {
+            ...identity,
+            cwd: ctx.cwd,
+            input,
+            ...(signal ? { signal } : {}),
+            startedAt,
+            toolName: registeredName,
+          };
+          identityOptions.onStart?.(createNestedToolCallStartRecord(call));
+          let error: unknown;
+          let output: string | undefined;
+          let result: NestedToolDispatchResult | undefined;
+          let status: NestedToolCallStatus = "failed";
+          let validationFailed = false;
           try {
-            await preflight({
-              cwd: ctx.cwd,
-              input: prepared as Record<string, unknown>,
-              toolName: definition.name,
-            });
-          } catch (error) {
-            throw new NestedToolPolicyError(
-              error instanceof Error ? error.message : String(error),
-              { cause: error },
+            signal?.throwIfAborted();
+            let prepared: unknown;
+            try {
+              prepared = prepareAndValidateInput(definition, input, registeredName);
+            } catch (cause) {
+              validationFailed = true;
+              throw cause;
+            }
+            call = { ...call, input: prepared as Record<string, unknown> };
+            if (preflight) {
+              try {
+                await withAbort(Promise.resolve(preflight(call)), signal);
+              } catch (cause) {
+                if (signal?.aborted) throw cause;
+                throw new NestedToolPolicyError(
+                  cause instanceof Error ? cause.message : String(cause),
+                  { cause },
+                );
+              }
+            }
+            if (before) {
+              try {
+                await withAbort(Promise.resolve(before(call)), signal);
+              } catch (cause) {
+                if (signal?.aborted) throw cause;
+                throw new NestedToolPolicyError(
+                  cause instanceof Error ? cause.message : String(cause),
+                  { cause },
+                );
+              }
+            }
+            result = await withAbort(
+              Promise.resolve(
+                dispatch
+                  ? dispatch(call, definition, ctx)
+                  : definition.execute(
+                      identity.childToolCallId,
+                      prepared,
+                      signal,
+                      undefined,
+                      ctx,
+                    ),
+              ),
+              signal,
             );
+            output = await flattenToolResult(result, registeredName);
+            status = "success";
+            return output;
+          } catch (cause) {
+            error = cause;
+            status = validationFailed
+              ? "validation_error"
+              : lifecycleStatus(cause, signal);
+            throw cause;
+          } finally {
+            const outcome: NestedToolCallOutcome = {
+              ...call,
+              durationMs: performance.now() - started,
+              ...(error === undefined ? {} : { error }),
+              ...(output === undefined ? {} : { output }),
+              ...(result === undefined ? {} : { result }),
+              status,
+            };
+            try {
+              await after?.({ ...outcome });
+            } finally {
+              identityOptions.onOutcome?.({
+                ...outcome,
+                durationMs: performance.now() - started,
+              });
+            }
           }
-        }
-        const result = await withAbort(
-          definition.execute(crypto.randomUUID(), prepared, signal, undefined, ctx),
-          signal,
-        );
-        return await flattenToolResult(result, definition.name);
-      },
-    ]),
+        },
+      ];
+    }),
   );

@@ -10,11 +10,16 @@ import {
   createBridgedDefinitions,
   createHostFunctions,
   createPythonDefinitions,
+  createPythonRegistrations,
   createToolCollection,
   flattenToolResult,
   renderToolSignature,
 } from "./host.ts";
-import type { AnyToolDefinition } from "./host.ts";
+import type {
+  AnyToolDefinition,
+  NestedToolCall,
+  NestedToolCallOutcome,
+} from "./host.ts";
 import { buildLauncher, extractScriptBlock } from "./launcher.ts";
 import { NestedToolPolicyError } from "./runner.ts";
 
@@ -44,8 +49,24 @@ describe("bridged definitions", () => {
 
   test("collects definitions exposed by trusted extensions", () => {
     const collection = createToolCollection();
+    const before = () => undefined;
     collection.add(definition("issues"), definition("weather"));
-    expect(collection.definitions.map(({ name }) => name)).toEqual(["issues", "weather"]);
+    collection.register(definition("approved"), { before });
+    expect(collection.definitions.map(({ name }) => name)).toEqual([
+      "issues",
+      "weather",
+      "approved",
+    ]);
+    expect(
+      collection.registrations.map(({ before: handler, definition: item }) => ({
+        hasBefore: handler !== undefined,
+        name: item.name,
+      })),
+    ).toEqual([
+      { hasBefore: false, name: "issues" },
+      { hasBefore: false, name: "weather" },
+      { hasBefore: true, name: "approved" },
+    ]);
   });
 });
 
@@ -72,12 +93,25 @@ describe("createPythonDefinitions", () => {
   });
 
   test("makes non-identifier names callable and keeps them unique", () => {
-    const renamed = createPythonDefinitions([
+    const definitions = [
       definition("Kagi/search"),
       definition("Kagi.search"),
       definition("2fast"),
-    ]).map((tool) => tool.name);
-    expect(renamed).toEqual(["Kagi_search", "Kagi_search_2", "_2fast"]);
+    ];
+    const registrations = createPythonRegistrations(definitions);
+    expect(
+      registrations.map(({ pythonName, registeredName }) => ({ pythonName, registeredName })),
+    ).toEqual([
+      { pythonName: "Kagi_search", registeredName: "Kagi/search" },
+      { pythonName: "Kagi_search_2", registeredName: "Kagi.search" },
+      { pythonName: "_2fast", registeredName: "2fast" },
+    ]);
+    expect(registrations.map(({ definition: item }) => item)).toEqual(definitions);
+    expect(createPythonDefinitions(definitions).map((tool) => tool.name)).toEqual([
+      "Kagi_search",
+      "Kagi_search_2",
+      "_2fast",
+    ]);
   });
 });
 
@@ -155,6 +189,212 @@ describe("createHostFunctions", () => {
     await expect(hosts.search?.({ nope: "x", query: "y" })).rejects.toThrow(
       /unknown property nope/u,
     );
+  });
+
+  test("allocates stable identities before validation and policy", async () => {
+    const search = definition("Kagi/search");
+    let executedId: string | undefined;
+    search.execute = ((id: string, input: { query: string }) => {
+      executedId = id;
+      return Promise.resolve({
+        content: [{ text: input.query, type: "text" }],
+        details: {},
+      });
+    }) as AnyToolDefinition["execute"];
+    const [registration] = createPythonRegistrations([search]);
+    if (!registration) throw new Error("expected registration");
+    const attempts: Array<{
+      childToolCallId: string;
+      parentToolCallId: string;
+      pythonName: string;
+      registeredName: string;
+    }> = [];
+    const policies: typeof attempts = [];
+    const hosts = createHostFunctions(
+      [registration],
+      ctx,
+      undefined,
+      (call) => {
+        policies.push(call);
+      },
+      {
+        onCall: (call) => attempts.push(call),
+        parentToolCallId: "outer-call",
+      },
+    );
+
+    await expect(hosts.Kagi_search?.({ query: 7 })).rejects.toThrow(
+      /Invalid arguments for Kagi\/search/u,
+    );
+    expect(attempts).toHaveLength(1);
+    expect(policies).toHaveLength(0);
+
+    expect(await hosts.Kagi_search?.({ query: "ok" })).toBe("ok");
+    expect(attempts).toHaveLength(2);
+    expect(policies).toEqual([
+      expect.objectContaining(attempts[1] ?? {}),
+    ]);
+    const invalidAttempt = attempts[0];
+    const validAttempt = attempts[1];
+    if (!invalidAttempt || !validAttempt) throw new Error("expected attempts");
+    expect(validAttempt).toMatchObject({
+      parentToolCallId: "outer-call",
+      pythonName: "Kagi_search",
+      registeredName: "Kagi/search",
+    });
+    if (!executedId) throw new Error("expected executed child ID");
+    expect(validAttempt.childToolCallId).toBe(executedId);
+    expect(invalidAttempt.childToolCallId).not.toBe(validAttempt.childToolCallId);
+  });
+
+  test("runs async lifecycle handlers for every terminal path", async () => {
+    const outcomes: NestedToolCallOutcome[] = [];
+    const beforeCalls: NestedToolCall[] = [];
+    let executions = 0;
+    const search = definition("search");
+    search.execute = (async (_id: string, input: { query: string }) => {
+      executions += 1;
+      if (input.query === "fail") throw new TypeError("tool type failure");
+      return {
+        content: [{ text: `result:${input.query}`, type: "text" }],
+        details: {},
+      };
+    }) as AnyToolDefinition["execute"];
+    const [registration] = createPythonRegistrations([
+      {
+        after: async (call) => {
+          await Promise.resolve();
+          outcomes.push(call);
+        },
+        before: async (call) => {
+          await Promise.resolve();
+          beforeCalls.push(call);
+          if (call.input.query === "block") throw new Error("approval denied");
+        },
+        definition: search,
+      },
+    ]);
+    if (!registration) throw new Error("expected registration");
+    const hosts = createHostFunctions([registration], ctx, undefined, undefined, {
+      parentToolCallId: "outer-lifecycle",
+    });
+
+    await expect(hosts.search?.({ query: 7 })).rejects.toThrow(/Invalid arguments/u);
+    await expect(hosts.search?.({ query: "block" })).rejects.toBeInstanceOf(
+      NestedToolPolicyError,
+    );
+    await expect(hosts.search?.({ query: "fail" })).rejects.toThrow("tool type failure");
+    expect(await hosts.search?.({ query: "ok" })).toBe("result:ok");
+
+    expect(beforeCalls.map(({ input }) => input.query)).toEqual(["block", "fail", "ok"]);
+    expect(outcomes.map(({ status }) => status)).toEqual([
+      "validation_error",
+      "blocked",
+      "failed",
+      "success",
+    ]);
+    expect(outcomes.every(({ parentToolCallId }) => parentToolCallId === "outer-lifecycle"))
+      .toBeTrue();
+    expect(new Set(outcomes.map(({ childToolCallId }) => childToolCallId)).size).toBe(4);
+    expect(outcomes[1]?.error).toBeInstanceOf(NestedToolPolicyError);
+    expect((outcomes[3]?.result as { content?: unknown[] } | undefined)?.content).toHaveLength(1);
+    expect(executions).toBe(2);
+  });
+
+  test("reports cancellation to lifecycle handlers with the run signal", async () => {
+    const controller = new AbortController();
+    let beforeCall: NestedToolCall | undefined;
+    let afterCall: NestedToolCallOutcome | undefined;
+    let executionId: string | undefined;
+    let executionSignal: AbortSignal | undefined;
+    let started: (() => void) | undefined;
+    const isStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const search = definition("search");
+    search.execute = ((id: string, _input: unknown, signal: AbortSignal | undefined) => {
+      executionId = id;
+      executionSignal = signal;
+      started?.();
+      return new Promise(() => undefined);
+    }) as AnyToolDefinition["execute"];
+    const [registration] = createPythonRegistrations([
+      {
+        after: (call) => {
+          afterCall = call;
+        },
+        before: (call) => {
+          beforeCall = call;
+        },
+        definition: search,
+      },
+    ]);
+    if (!registration) throw new Error("expected registration");
+    const hosts = createHostFunctions([registration], ctx, controller.signal, undefined, {
+      parentToolCallId: "outer-cancel",
+    });
+
+    const call = Promise.resolve(hosts.search?.({ query: "wait" }));
+    await isStarted;
+    controller.abort(new Error("cancel nested call"));
+    await expect(call).rejects.toThrow("operation aborted");
+
+    if (!beforeCall || !afterCall || !executionId) {
+      throw new Error("expected complete cancellation lifecycle");
+    }
+    expect(beforeCall.signal).toBe(controller.signal);
+    expect(afterCall.signal).toBe(controller.signal);
+    expect(executionSignal).toBe(controller.signal);
+    expect(afterCall.status).toBe("cancelled");
+    expect(afterCall.childToolCallId).toBe(beforeCall.childToolCallId);
+    expect(afterCall.childToolCallId).toBe(executionId);
+    expect(afterCall.parentToolCallId).toBe("outer-cancel");
+  });
+
+  test("runs legacy policy before lifecycle hooks and supports a dispatcher adapter", async () => {
+    const order: string[] = [];
+    const search = definition("Kagi/search");
+    search.execute = (() => {
+      throw new Error("direct execution must not run");
+    }) as AnyToolDefinition["execute"];
+    const [registration] = createPythonRegistrations([
+      {
+        after: (call) => {
+          order.push(`after:${call.status}`);
+        },
+        before: (call) => {
+          order.push(`before:${call.registeredName}`);
+        },
+        definition: search,
+        dispatch: (call, dispatchedDefinition, dispatchedContext) => {
+          order.push(`dispatch:${call.registeredName}`);
+          expect(dispatchedDefinition).toBe(search);
+          expect(dispatchedContext).toBe(ctx);
+          return Promise.resolve({
+            content: [{ text: "adapted", type: "text" }],
+            details: {},
+          });
+        },
+      },
+    ]);
+    if (!registration) throw new Error("expected registration");
+    const hosts = createHostFunctions(
+      [registration],
+      ctx,
+      undefined,
+      (call) => {
+        order.push(`legacy:${call.toolName}`);
+      },
+      { parentToolCallId: "outer-adapter" },
+    );
+
+    expect(await hosts.Kagi_search?.({ query: "x" })).toBe("adapted");
+    expect(order).toEqual([
+      "legacy:Kagi/search",
+      "before:Kagi/search",
+      "dispatch:Kagi/search",
+      "after:success",
+    ]);
   });
 
   test("runs the preflight hook and lets it block the call", async () => {

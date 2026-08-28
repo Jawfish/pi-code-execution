@@ -31,15 +31,24 @@ import {
   truncateOutput,
 } from "./core.ts";
 import {
+  aggregateNestedToolUsage,
   CODE_EXECUTION_COLLECT_TOOLS_EVENT,
-  createBridgedDefinitions,
+  createBridgedRegistrations,
   createHostFunctions,
-  createPythonDefinitions,
+  createNestedToolCallRecord,
+  createPythonRegistrations,
   createToolCollection,
   MAX_RECOVERED_TOOL_OUTPUT_BYTES,
   renderToolSignature,
 } from "./host.ts";
-import type { AnyToolDefinition, NestedToolCallPreflight } from "./host.ts";
+import type {
+  NestedToolCall,
+  NestedToolCallIdentity,
+  NestedToolCallPreflight,
+  NestedToolCallRecord as HostNestedToolCallRecord,
+  NestedToolCallStartRecord,
+  NestedToolRegistrationInput,
+} from "./host.ts";
 import {
   loadOutputArtifact,
   OutputArtifactUnavailableError,
@@ -193,7 +202,7 @@ export type CodeExecutionInput = Static<typeof parameters>;
 export type CodeExecutionOutputInput = Static<typeof outputParameters>;
 export type CodeExecutionSourceInput = Static<typeof sourceParameters>;
 
-export type NestedToolCallRecord = Record<string, unknown>;
+export type NestedToolCallRecord = HostNestedToolCallRecord;
 
 export interface CodeExecutionFinalDetails {
   durationMs: number;
@@ -252,13 +261,17 @@ const MAX_LIVE_STREAM_BYTES = Math.floor(
 );
 
 export const NESTED_TOOL_CALL_EVENT = "code_execution:tool_call";
+export const NESTED_TOOL_START_EVENT = "code_execution:nested_tool_start";
+export const NESTED_TOOL_FINISH_EVENT = "code_execution:nested_tool_finish";
 
-export interface NestedToolCallInterception {
+export interface NestedToolCallInterception extends NestedToolCall {
   block?: boolean;
-  cwd: string;
-  input: Record<string, unknown>;
   reason?: string;
-  toolName: string;
+}
+
+export interface NestedToolLifecycleObserver {
+  onFinish?: (record: NestedToolCallRecord) => void;
+  onStart?: (record: NestedToolCallStartRecord) => void;
 }
 
 type ContextMessage = ContextEvent["messages"][number];
@@ -355,14 +368,56 @@ Saved output
 
 Environment: runs with your full privileges in the session working directory (relative paths resolve there) with network access, as a fresh process each call with no state persisting between runs. Default deadline is 30 seconds (maximum 300), covering dependency installation and tool calls.`;
 
+interface NestedToolCallTracker {
+  onCall: (identity: NestedToolCallIdentity) => void;
+  onRecord: (record: NestedToolCallRecord) => void;
+  records: () => NestedToolCallRecord[];
+  waitForSettled: () => Promise<void>;
+}
+
+const createNestedToolCallTracker = (): NestedToolCallTracker => {
+  const order: string[] = [];
+  const records = new Map<string, NestedToolCallRecord>();
+  const waiters = new Set<() => void>();
+  let pending = 0;
+  const settle = (): void => {
+    if (pending !== 0) return;
+    for (const resolve of waiters) resolve();
+    waiters.clear();
+  };
+  return {
+    onCall: ({ childToolCallId }) => {
+      order.push(childToolCallId);
+      pending += 1;
+    },
+    onRecord: (record) => {
+      if (records.has(record.childToolCallId)) return;
+      records.set(record.childToolCallId, record);
+      pending = Math.max(0, pending - 1);
+      settle();
+    },
+    records: () => order.flatMap((id) => {
+      const record = records.get(id);
+      return record ? [record] : [];
+    }),
+    waitForSettled: () =>
+      pending === 0
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            waiters.add(resolve);
+          }),
+  };
+};
+
 const finalDetails = (
   result: RunResult,
   sourceRef: CodeArtifactReference,
+  nestedCalls: NestedToolCallRecord[],
   outputRef?: OutputArtifactReference,
 ): CodeExecutionFinalDetails => ({
   durationMs: result.durationMs,
   ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
-  nestedCalls: [],
+  nestedCalls,
   ...(outputRef ? { outputRef } : {}),
   ...(result.signal === undefined ? {} : { signal: result.signal }),
   sourceRef,
@@ -503,11 +558,12 @@ export const createCodeExecutionTool = (
     reference: CodeArtifactReference,
   ) => Promise<LoadedCodeArtifact> = loadCodeArtifact,
   preflight?: NestedToolCallPreflight,
-  getDefinitions: () => AnyToolDefinition[] = () => [],
+  getDefinitions: () => NestedToolRegistrationInput[] = () => [],
   saveOutput: (
     spool: OutputSpool,
     toolCallId: string,
   ) => Promise<OutputArtifactReference | undefined> = saveOutputArtifact,
+  lifecycleObserver?: NestedToolLifecycleObserver,
 ): ToolDefinition<typeof parameters, CodeExecutionDetails> => ({
   description: BASE_DESCRIPTION,
   async execute(toolCallId, input, signal, onUpdate, ctx) {
@@ -551,25 +607,37 @@ export const createCodeExecutionTool = (
     }
     const sourceRef = { ...codeSourceReference(code, toolCallId), artifactId };
     let outputRef: OutputArtifactReference | undefined;
+    const nestedCallTracker = createNestedToolCallTracker();
     let streamedStdout = "";
     let streamedStderr = "";
     const timeoutSecs = input.timeout ?? DEFAULT_TIMEOUT_SECS;
-    const runtimeDefinitions = createBridgedDefinitions(getDefinitions());
+    const runtimeRegistrations = createBridgedRegistrations(getDefinitions());
     const activeToolNames = new Set(
-      getActiveToolNames?.() ?? runtimeDefinitions.map(({ name }) => name),
+      getActiveToolNames?.() ??
+        runtimeRegistrations.map(({ definition }) => definition.name),
     );
-    const activeDefinitions = createPythonDefinitions(runtimeDefinitions).filter(
-      (_definition, index) => activeToolNames.has(runtimeDefinitions[index]?.name ?? ""),
+    const activeRegistrations = createPythonRegistrations(runtimeRegistrations).filter(
+      ({ registeredName }) => activeToolNames.has(registeredName),
     );
     const toolSignatures = Object.fromEntries(
-      activeDefinitions.map((definition) => [
-        definition.name,
-        renderToolSignature(definition).replace(/^- /u, ""),
+      activeRegistrations.map(({ definition, pythonName }) => [
+        pythonName,
+        renderToolSignature({ ...definition, name: pythonName }).replace(/^- /u, ""),
       ]),
     );
     const result = await runner.run(
       code,
-      (runSignal) => createHostFunctions(activeDefinitions, ctx, runSignal, preflight),
+      (runSignal) =>
+        createHostFunctions(activeRegistrations, ctx, runSignal, preflight, {
+          onCall: nestedCallTracker.onCall,
+          onOutcome: (outcome) => {
+            const record = createNestedToolCallRecord(outcome);
+            nestedCallTracker.onRecord(record);
+            lifecycleObserver?.onFinish?.(record);
+          },
+          onStart: lifecycleObserver?.onStart,
+          parentToolCallId: toolCallId,
+        }),
       ({ stream, text }) => {
         if (stream === "stdout") {
           streamedStdout = appendLiveOutputTail(streamedStdout, text, MAX_LIVE_STREAM_BYTES);
@@ -592,10 +660,14 @@ export const createCodeExecutionTool = (
         toolSignatures,
       },
     );
+    await nestedCallTracker.waitForSettled();
+    const nestedCalls = nestedCallTracker.records();
+    const nestedUsage = aggregateNestedToolUsage(nestedCalls);
     const output = finalOutput(result, outputRef);
     return {
       content: [{ text: output, type: "text" }],
-      details: finalDetails(result, sourceRef, outputRef),
+      details: finalDetails(result, sourceRef, nestedCalls, outputRef),
+      ...(nestedUsage ? { usage: nestedUsage } : {}),
     };
   },
   executionMode: "sequential",
@@ -942,10 +1014,10 @@ export default function codeExecutionExtension(pi: ExtensionAPI): void {
       throw new Error(event.reason ?? `Nested ${event.toolName} call blocked`);
     }
   };
-  const getDefinitions = (): AnyToolDefinition[] => {
+  const getDefinitions = (): NestedToolRegistrationInput[] => {
     const collection = createToolCollection();
     pi.events.emit(CODE_EXECUTION_COLLECT_TOOLS_EVENT, collection);
-    return collection.definitions;
+    return collection.registrations;
   };
   pi.registerTool(
     createCodeExecutionTool(
@@ -956,6 +1028,14 @@ export default function codeExecutionExtension(pi: ExtensionAPI): void {
       preflight,
       getDefinitions,
       saveOutputArtifact,
+      {
+        onFinish: (record) => {
+          pi.events.emit(NESTED_TOOL_FINISH_EVENT, structuredClone(record));
+        },
+        onStart: (record) => {
+          pi.events.emit(NESTED_TOOL_START_EVENT, structuredClone(record));
+        },
+      },
     ),
   );
   pi.registerTool(createCodeExecutionOutputTool(loadOutputArtifact));
