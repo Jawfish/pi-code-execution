@@ -2,6 +2,7 @@ import { highlightCode } from "@earendil-works/pi-coding-agent";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 
 import { NO_OUTPUT } from "./core.ts";
+import type { RunStatus } from "./runner.ts";
 
 export const COLLAPSED_SCRIPT_LINES = 12;
 export const COLLAPSED_OUTPUT_LINES = 3;
@@ -33,15 +34,51 @@ export const renderScriptText = (
   return [heading, ...rendered].join("\n");
 };
 
+export type ExecutionRenderStatus = "running" | RunStatus;
+
+interface StatusStyle {
+  color: "error" | "toolOutput" | "warning";
+  headingColor: "error" | "success" | "toolTitle" | "warning";
+  label: string;
+}
+
+const statusStyle = (
+  status: ExecutionRenderStatus | undefined,
+  isError: boolean,
+): StatusStyle => {
+  switch (status) {
+    case "success":
+      return { color: "toolOutput", headingColor: "success", label: "Success" };
+    case "timeout":
+      return { color: "warning", headingColor: "warning", label: "Timed out" };
+    case "cancelled":
+      return { color: "warning", headingColor: "warning", label: "Cancelled" };
+    case "policy_error":
+    case "runtime_error":
+    case "setup_error":
+      return { color: "error", headingColor: "error", label: "Error" };
+    case "running":
+      return { color: "toolOutput", headingColor: "toolTitle", label: "Output" };
+    default:
+      return isError
+        ? { color: "error", headingColor: "error", label: "Error" }
+        : { color: "toolOutput", headingColor: "toolTitle", label: "Output" };
+  }
+};
+
 export const renderOutputText = (
   output: string,
   expanded: boolean,
   theme: Theme,
   isError = false,
   isPartial = false,
+  status?: ExecutionRenderStatus,
 ): string => {
+  const style = statusStyle(status, isError);
   if (output === NO_OUTPUT) {
-    return `\n${theme.fg("success", theme.bold("Done"))}${theme.fg("dim", " · no output")}`;
+    const label = status === "success" ? style.label : "Done";
+    const color = status === "success" ? style.headingColor : "success";
+    return `\n${theme.fg(color, theme.bold(label))}${theme.fg("dim", " · no output")}`;
   }
   const lines = output.split("\n");
   const visible = expanded
@@ -49,9 +86,7 @@ export const renderOutputText = (
     : isPartial
       ? lines.slice(-COLLAPSED_OUTPUT_LINES)
       : lines.slice(0, COLLAPSED_OUTPUT_LINES);
-  const color = isError ? "error" : "toolOutput";
-  const headingColor = isError ? "error" : "toolTitle";
-  const label = isError ? "Error" : "Output";
+  const { color, headingColor, label } = style;
   const heading = `${theme.fg(headingColor, theme.bold(label))}${theme.fg(
     "dim",
     ` · ${lineCount(lines.length)}${isPartial ? " · live" : ""}`,

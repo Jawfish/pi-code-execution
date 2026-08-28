@@ -765,6 +765,35 @@ describe("code_execution tool", () => {
     }
   });
 
+  test("keeps Python-specific hints in structured failure output", async () => {
+    const dir = await tempDir();
+    const runner = new SandboxRunner();
+    const search = definition("search_issues");
+    const tool = createCodeExecutionTool(
+      runner,
+      saveTestArtifact,
+      () => ["search_issues"],
+      undefined,
+      undefined,
+      () => [search],
+    );
+    try {
+      const result = await executeForTest(
+        tool,
+        {
+          code: "value = search_issues(query='x')\nprint(value.get('items'))",
+        },
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(expectFinalDetails(result.details).status).toBe("runtime_error");
+      expect(result.content[0]?.type === "text" && result.content[0].text).toContain(
+        "Tools are async",
+      );
+    } finally {
+      await runner.close();
+    }
+  });
+
   test("returns timeout details instead of throwing them away", async () => {
     const dir = await tempDir();
     const runner = new SandboxRunner();
@@ -784,9 +813,9 @@ describe("code_execution tool", () => {
         stderrTruncated: false,
         stdoutTruncated: false,
       });
-      expect(result.content[0]?.type === "text" && result.content[0].text).toMatch(
-        /deadline/iu,
-      );
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      expect(text).toMatch(/deadline/iu);
+      expect(text).toContain("Raise timeout");
     } finally {
       await runner.close();
     }

@@ -455,7 +455,14 @@ export const createCodeExecutionTool = (
       .map((item) => item.text)
       .join("\n");
     return new Text(
-      renderOutputText(text, options.expanded, theme, context.isError, options.isPartial),
+      renderOutputText(
+        text,
+        options.expanded,
+        theme,
+        context.isError,
+        options.isPartial,
+        result.details.status,
+      ),
       0,
       0,
     );
