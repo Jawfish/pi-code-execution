@@ -46,13 +46,31 @@ export interface RunnerOptions {
   toolSignatures?: Record<string, string>;
 }
 
+export type RunStatus =
+  | "cancelled"
+  | "policy_error"
+  | "runtime_error"
+  | "setup_error"
+  | "success"
+  | "timeout";
+
 export interface RunResult {
+  diagnostic?: string;
+  durationMs: number;
+  exitCode?: number;
+  signal?: NodeJS.Signals;
+  status: RunStatus;
   stderr?: string;
-  stderrBytes?: number;
-  stderrTruncated?: boolean;
+  stderrBytes: number;
+  stderrTruncated: boolean;
   stdout: string;
-  stdoutBytes?: number;
-  stdoutTruncated?: boolean;
+  stdoutBytes: number;
+  stdoutTruncated: boolean;
+}
+
+/** Marks a rejected nested call without relying on its human-readable reason. */
+export class NestedToolPolicyError extends Error {
+  override readonly name = "NestedToolPolicyError";
 }
 
 export interface OutputChunk {
@@ -80,6 +98,7 @@ interface DispatchRequest {
 }
 
 interface DispatchServer {
+  policyError: () => NestedToolPolicyError | undefined;
   port: number;
   stop: () => Promise<void>;
 }
@@ -136,6 +155,7 @@ const startDispatchServer = async (
 ): Promise<DispatchServer> => {
   const sockets = new Set<Socket>();
   let pending = 0;
+  let policyError: NestedToolPolicyError | undefined;
   let stopped = false;
   let stopPromise: Promise<void> | undefined;
 
@@ -221,6 +241,9 @@ const startDispatchServer = async (
           send({ id: request.id, ok: true, value });
         }
       } catch (error) {
+        if (error instanceof NestedToolPolicyError) {
+          policyError ??= error;
+        }
         if (!signal.aborted) {
           send({
             error: error instanceof Error ? error.message : String(error),
@@ -277,7 +300,7 @@ const startDispatchServer = async (
     await stop();
     throw signal.reason ?? new Error("code execution was cancelled");
   }
-  return { port: address.port, stop };
+  return { policyError: () => policyError, port: address.port, stop };
 };
 
 type PythonProcess = ChildProcessByStdio<null, Readable, Readable>;
@@ -359,11 +382,19 @@ const signalProcess = (child: PythonProcess, signal: NodeJS.Signals): boolean =>
   return child.kill(signal);
 };
 
-const waitForExit = (child: PythonProcess): Promise<number> =>
+interface ProcessExit {
+  exitCode?: number;
+  signal?: NodeJS.Signals;
+}
+
+const waitForExit = (child: PythonProcess): Promise<ProcessExit> =>
   new Promise((resolve, reject) => {
-    const onExit = (code: number | null): void => {
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
       child.off("error", onError);
-      resolve(code ?? -1);
+      resolve({
+        ...(code === null ? {} : { exitCode: code }),
+        ...(signal === null ? {} : { signal }),
+      });
     };
     const onError = (error: Error): void => {
       child.off("exit", onExit);
@@ -389,10 +420,11 @@ interface CappedStream {
   truncated: boolean;
 }
 
-/** Read a stream without retaining unbounded stderr in the extension process. */
+/** Read and count a stream while retaining only a bounded head or tail. */
 const readCappedStream = async (
   stream: NodeJS.ReadableStream,
   maxBytes: number,
+  retention: "head" | "tail",
   onOutput?: (text: string) => void,
 ): Promise<CappedStream> => {
   const limit = Math.max(0, maxBytes);
@@ -404,20 +436,24 @@ const readCappedStream = async (
     bytes += data.length;
     const decoded = decoder.decode(data, { stream: true });
     if (decoded) onOutput?.(decoded);
-    if (limit === 0) continue;
-    if (data.length >= limit) {
+    if (limit === 0 || (retention === "head" && captured.length >= limit)) continue;
+    if (retention === "head") {
+      captured = Buffer.concat([captured, data]).subarray(0, limit);
+    } else if (data.length >= limit) {
       captured = data.subarray(data.length - limit);
-      continue;
-    }
-    captured = Buffer.concat([captured, data]);
-    if (captured.length > limit) {
-      captured = captured.subarray(captured.length - limit);
+    } else {
+      captured = Buffer.concat([captured, data]);
+      if (captured.length > limit) {
+        captured = captured.subarray(captured.length - limit);
+      }
     }
   }
   const finalText = decoder.decode();
   if (finalText) onOutput?.(finalText);
   const truncated = captured.length < bytes;
-  const text = captured.toString("utf-8").replace(/^\uFFFD/u, "");
+  const decoded = captured.toString("utf-8");
+  const text =
+    retention === "head" ? decoded.replace(/\uFFFD$/u, "") : decoded.replace(/^\uFFFD/u, "");
   return { bytes, text, truncated };
 };
 
@@ -464,6 +500,7 @@ export class SandboxRunner {
     options: RunnerOptions,
     controller: AbortController,
   ): Promise<RunResult> {
+    const startedAt = performance.now();
     const timeoutSecs = options.timeoutSecs ?? DEFAULT_TIMEOUT_SECS;
     const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES;
     const maxStderrBytes = options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES;
@@ -490,6 +527,26 @@ export class SandboxRunner {
     let directory: string | undefined;
     let server: DispatchServer | undefined;
     let stopChild: (() => Promise<void>) | undefined;
+    let stderr = "";
+    let stderrBytes = 0;
+    let stderrTruncated = false;
+    let stdout = "";
+    let stdoutBytes = 0;
+    let stdoutTruncated = false;
+    let processExit: ProcessExit = {};
+    let streamError: unknown;
+    const outcome = (status: RunStatus, diagnostic?: string): RunResult => ({
+      ...(diagnostic ? { diagnostic } : {}),
+      durationMs: performance.now() - startedAt,
+      ...processExit,
+      status,
+      ...(stderr ? { stderr } : {}),
+      stderrBytes,
+      stderrTruncated,
+      stdout,
+      stdoutBytes,
+      stdoutTruncated,
+    });
 
     try {
       throwIfAborted();
@@ -499,6 +556,7 @@ export class SandboxRunner {
       throwIfAborted();
       const scriptPath = path.join(directory, USER_SCRIPT_NAME);
       const launcherPath = path.join(directory, "_pi_launcher.py");
+      const setupMarkerPath = path.join(directory, "setup-complete");
       const token = randomBytes(32).toString("base64url");
       const watchdogMarker = `${WATCHDOG_MARKER_PREFIX}${randomBytes(16).toString("hex")}__`;
       await writeFile(scriptPath, code, "utf-8");
@@ -512,6 +570,7 @@ export class SandboxRunner {
           PI_DEADLINE_SECS: String(timeoutSecs),
           PI_HOST_PORT: String(server.port),
           PI_HOST_TOKEN: token,
+          PI_SETUP_MARKER: setupMarkerPath,
           PI_TOOL_NAMES: JSON.stringify(Object.keys(tools)),
           PI_TOOL_SIGNATURES: JSON.stringify(options.toolSignatures ?? {}),
           PI_WATCHDOG_MARKER: watchdogMarker,
@@ -534,60 +593,25 @@ export class SandboxRunner {
         onRunAbort();
       }
 
-      let stdout = "";
-      let stdoutBytes = 0;
-      let stdoutTruncated = false;
       const collectStdout = async (): Promise<void> => {
-        const decoder = new TextDecoder();
-        for await (const chunk of child.stdout) {
-          const text = decoder.decode(chunk, { stream: true });
-          if (!text) continue;
-          stdoutBytes += Buffer.byteLength(text, "utf-8");
-          const remaining = maxStdoutBytes - Buffer.byteLength(stdout, "utf-8");
-          if (remaining <= 0) {
-            stdoutTruncated = true;
-          } else {
-            const accepted = Buffer.from(text)
-              .subarray(0, remaining)
-              .toString("utf-8")
-              .replace(/\uFFFD$/u, "");
-            stdout += accepted;
-            stdoutTruncated ||=
-              Buffer.byteLength(accepted, "utf-8") < Buffer.byteLength(text, "utf-8");
-          }
-          onOutput?.({ stream: "stdout", text });
-        }
-        const finalText = decoder.decode();
-        if (finalText) {
-          stdoutBytes += Buffer.byteLength(finalText, "utf-8");
-          const remaining = maxStdoutBytes - Buffer.byteLength(stdout, "utf-8");
-          const accepted = Buffer.from(finalText)
-            .subarray(0, Math.max(remaining, 0))
-            .toString("utf-8")
-            .replace(/\uFFFD$/u, "");
-          stdout += accepted;
-          stdoutTruncated ||=
-            Buffer.byteLength(accepted, "utf-8") < Buffer.byteLength(finalText, "utf-8");
-          onOutput?.({ stream: "stdout", text: finalText });
-        }
+        const captured = await readCappedStream(child.stdout, maxStdoutBytes, "head", (text) =>
+          onOutput?.({ stream: "stdout", text }),
+        );
+        ({ bytes: stdoutBytes, text: stdout, truncated: stdoutTruncated } = captured);
       };
-      let stderr = "";
-      let stderrBytes = 0;
-      let stderrTruncated = false;
       const collectStderr = async (): Promise<void> => {
-        const captured = await readCappedStream(child.stderr, maxStderrBytes, (text) =>
+        const captured = await readCappedStream(child.stderr, maxStderrBytes, "tail", (text) =>
           onOutput?.({ stream: "stderr", text }),
         );
         ({ bytes: stderrBytes, text: stderr, truncated: stderrTruncated } = captured);
       };
-      let streamError: unknown;
       const drained = Promise.all([collectStdout(), collectStderr()]).catch((error: unknown) => {
         if (!signal.aborted) {
           streamError = error;
           controller.abort(error);
         }
       });
-      const exitCode = await exit;
+      processExit = await exit;
       // uv can exit before a subprocess. On POSIX, terminate its group so a
       // descendant cannot keep the output pipes open. Windows is direct-child only.
       const cleanedUp = stopChild();
@@ -603,14 +627,12 @@ export class SandboxRunner {
       await cleanedUp;
       signal.removeEventListener("abort", onRunAbort);
 
-      if (timedOut || stderr.includes(watchdogMarker)) {
-        throw new Error(explainSandboxError(timeoutError.message, code));
-      }
       if (streamError !== undefined) {
         throw streamError;
       }
-      if (signal.aborted) {
-        throw cancelError;
+      const watchdogTimedOut = stderr.includes(watchdogMarker);
+      if (watchdogTimedOut) {
+        stderr = stderr.replace(watchdogMarker, "");
       }
       if (stdoutTruncated) {
         stdout = `[stdout truncated: showing the first ${Buffer.byteLength(stdout, "utf-8")} of ${stdoutBytes} bytes]\n${stdout}`;
@@ -618,18 +640,41 @@ export class SandboxRunner {
       if (stderrTruncated) {
         stderr = `[stderr truncated: showing the last ${Buffer.byteLength(stderr, "utf-8")} of ${stderrBytes} bytes]\n${stderr}`;
       }
-      // Exit 124 is a normal user-controlled exit status. Only our random
-      // watchdog marker or explicit timeout state represents a timeout.
-      if (exitCode !== 0) {
-        throw new Error(explainSandboxError(stderr.trim() || `uv exited with ${exitCode}`, code));
+      if (timedOut || watchdogTimedOut) {
+        return outcome("timeout", explainSandboxError(timeoutError.message, code));
       }
-      return {
-        ...(stderr
-          ? { stderr, ...(stderrTruncated ? { stderrBytes, stderrTruncated: true } : {}) }
-          : {}),
-        stdout,
-        ...(stdoutTruncated ? { stdoutBytes, stdoutTruncated: true } : {}),
-      };
+      if (signal.aborted) {
+        return outcome("cancelled", cancelError.message);
+      }
+      const policyError = server.policyError();
+      if (policyError) {
+        return outcome("policy_error", policyError.message);
+      }
+
+      const setupComplete = await stat(setupMarkerPath).then(
+        (metadata) => metadata.isFile(),
+        () => false,
+      );
+      if (processExit.exitCode !== 0 || processExit.signal) {
+        const processMessage = processExit.signal
+          ? `uv terminated by ${processExit.signal}`
+          : `uv exited with ${String(processExit.exitCode)}`;
+        const diagnostic = explainSandboxError(stderr.trim() || processMessage, code);
+        return outcome(setupComplete ? "runtime_error" : "setup_error", diagnostic);
+      }
+      return outcome("success");
+    } catch (error) {
+      if (streamError !== undefined) {
+        throw streamError;
+      }
+      if (timedOut) {
+        return outcome("timeout", explainSandboxError(timeoutError.message, code));
+      }
+      if (signal.aborted) {
+        return outcome("cancelled", cancelError.message);
+      }
+      const diagnostic = error instanceof Error ? error.message : String(error);
+      return outcome("setup_error", explainSandboxError(diagnostic, code));
     } finally {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onCallerAbort);

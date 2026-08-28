@@ -16,6 +16,7 @@ import {
 } from "./host.ts";
 import type { AnyToolDefinition } from "./host.ts";
 import { buildLauncher, extractScriptBlock } from "./launcher.ts";
+import { NestedToolPolicyError } from "./runner.ts";
 
 const definition = (
   name: string,
@@ -162,7 +163,11 @@ describe("createHostFunctions", () => {
       seen.push(call.toolName);
       throw new Error("blocked by policy");
     });
-    await expect(hosts.search?.({ query: "x" })).rejects.toThrow("blocked by policy");
+    const error = await Promise.resolve(hosts.search?.({ query: "x" })).catch(
+      (cause: Error) => cause,
+    );
+    expect(error).toBeInstanceOf(NestedToolPolicyError);
+    expect((error as Error).message).toBe("blocked by policy");
     expect(seen).toEqual(["search"]);
   });
 

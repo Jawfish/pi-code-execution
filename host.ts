@@ -4,6 +4,7 @@ import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding
 import type { TSchema } from "typebox";
 import { Check, Errors } from "typebox/value";
 
+import { NestedToolPolicyError } from "./runner.ts";
 import type { HostFunctions } from "./runner.ts";
 
 // Tool definitions are intentionally heterogeneous at this dispatch boundary.
@@ -440,11 +441,20 @@ export const createHostFunctions = (
       async (input: Record<string, unknown>) => {
         signal?.throwIfAborted();
         const prepared = prepareAndValidateInput(definition, input);
-        await preflight?.({
-          cwd: ctx.cwd,
-          input: prepared as Record<string, unknown>,
-          toolName: definition.name,
-        });
+        if (preflight) {
+          try {
+            await preflight({
+              cwd: ctx.cwd,
+              input: prepared as Record<string, unknown>,
+              toolName: definition.name,
+            });
+          } catch (error) {
+            throw new NestedToolPolicyError(
+              error instanceof Error ? error.message : String(error),
+              { cause: error },
+            );
+          }
+        }
         const result = await withAbort(
           definition.execute(crypto.randomUUID(), prepared, signal, undefined, ctx),
           signal,

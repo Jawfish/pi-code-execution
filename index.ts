@@ -312,6 +312,9 @@ export const createCodeExecutionTool = (
       },
       { cwd: ctx.cwd, signal, timeoutSecs, toolSignatures },
     );
+    if (result.status !== "success") {
+      throw new Error(result.diagnostic ?? `code execution ended with ${result.status}`);
+    }
     const output = truncateOutput(assembleOutput(result.stdout, result.stderr));
     return {
       content: [{ text: output, type: "text" }],

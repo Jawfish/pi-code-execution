@@ -7,8 +7,10 @@ import {
   DEFAULT_MAX_STDERR_BYTES,
   DEFAULT_MAX_STDOUT_BYTES,
   MISSING_UV_MESSAGE,
+  NestedToolPolicyError,
   SandboxRunner,
 } from "./runner.ts";
+import type { RunResult } from "./runner.ts";
 
 const fail = () => {
   throw new Error("boom");
@@ -59,6 +61,11 @@ const withRunner = async (fn: (runner: SandboxRunner) => Promise<void>) => {
   }
 };
 
+const expectTimedOutcome = (result: RunResult): void => {
+  expect(result.durationMs).toBeGreaterThanOrEqual(0);
+  expect(Number.isFinite(result.durationMs)).toBeTrue();
+};
+
 describe("SandboxRunner", () => {
   test("caps default stdout and stderr capture at 20 KiB", () => {
     expect(DEFAULT_MAX_STDOUT_BYTES).toBe(20 * 1024);
@@ -102,7 +109,17 @@ describe("SandboxRunner", () => {
         {},
         (chunk) => streamed.push(chunk),
       );
-      expect(result).toEqual({ stderr: "warning\n", stdout: "hello\n" });
+      expect(result).toMatchObject({
+        exitCode: 0,
+        status: "success",
+        stderr: "warning\n",
+        stderrBytes: 8,
+        stderrTruncated: false,
+        stdout: "hello\n",
+        stdoutBytes: 6,
+        stdoutTruncated: false,
+      });
+      expectTimedOutcome(result);
       expect(streamed.filter(({ stream }) => stream === "stdout").map(({ text }) => text).join(""))
         .toBe("hello\n");
       expect(streamed.filter(({ stream }) => stream === "stderr").map(({ text }) => text).join(""))
@@ -115,7 +132,16 @@ describe("SandboxRunner", () => {
       const result = await runner.run(
         "import sys\nprint('out')\nprint('warning', file=sys.stderr)",
       );
-      expect(result).toEqual({ stderr: "warning\n", stdout: "out\n" });
+      expect(result).toMatchObject({
+        exitCode: 0,
+        status: "success",
+        stderr: "warning\n",
+        stderrBytes: 8,
+        stderrTruncated: false,
+        stdout: "out\n",
+        stdoutBytes: 4,
+        stdoutTruncated: false,
+      });
     });
   });
 
@@ -135,12 +161,16 @@ describe("SandboxRunner", () => {
 
   test("keeps a truncated failing traceback and reports the true size", async () => {
     await withRunner(async (runner) => {
-      const error = await runner
-        .run("import sys\nprint('x' * 30000, file=sys.stderr)\nraise RuntimeError('tail-visible')")
-        .catch((cause: Error) => cause);
-      expect((error as Error).message).toContain("stderr truncated");
-      expect((error as Error).message).toMatch(/showing the last 20480 of 30\d{3} bytes/u);
-      expect((error as Error).message).toContain("RuntimeError: tail-visible");
+      const result = await runner.run(
+        "import sys\nprint('x' * 30000, file=sys.stderr)\nraise RuntimeError('tail-visible')",
+      );
+      expect(result.status).toBe("runtime_error");
+      expect(result.stderr).toContain("stderr truncated");
+      expect(result.stderr).toMatch(/showing the last 20480 of 30\d{3} bytes/u);
+      expect(result.stderr).toContain("RuntimeError: tail-visible");
+      expect(result.stderrBytes).toBeGreaterThan(30_000);
+      expect(result.stderrTruncated).toBeTrue();
+      expect(result.diagnostic).toContain("RuntimeError: tail-visible");
     });
   });
 
@@ -155,19 +185,39 @@ describe("SandboxRunner", () => {
     });
   });
 
-  test("reports syntax and runtime errors", async () => {
+  test("classifies syntax and runtime errors", async () => {
     await withRunner(async (runner) => {
-      await expect(runner.run("def")).rejects.toThrow("SyntaxError");
-      await expect(runner.run("1 / 0")).rejects.toThrow("ZeroDivisionError");
+      const syntax = await runner.run("def");
+      const runtime = await runner.run("1 / 0");
+      expect(syntax.status).toBe("runtime_error");
+      expect(syntax.diagnostic).toContain("SyntaxError");
+      expect(runtime.status).toBe("runtime_error");
+      expect(runtime.diagnostic).toContain("ZeroDivisionError");
+    });
+  });
+
+  test("retains stdout when user code fails", async () => {
+    await withRunner(async (runner) => {
+      const result = await runner.run("print('important stdout', flush=True)\nraise RuntimeError('boom')");
+      expect(result).toMatchObject({
+        exitCode: 1,
+        status: "runtime_error",
+        stderrTruncated: false,
+        stdout: "important stdout\n",
+        stdoutBytes: 17,
+        stdoutTruncated: false,
+      });
+      expect(result.stderrBytes).toBeGreaterThan(0);
+      expect(result.diagnostic).toContain("RuntimeError: boom");
     });
   });
 
   test("tracebacks use the model's own line numbers and hide the launcher", async () => {
     await withRunner(async (runner) => {
       const code = ["x = 1", "y = 2", "raise ValueError('line-check')"].join("\n");
-      const error = await runner.run(code).catch((cause: Error) => cause);
-      expect(error).toBeInstanceOf(Error);
-      const message = (error as Error).message;
+      const result = await runner.run(code);
+      expect(result.status).toBe("runtime_error");
+      const message = result.diagnostic ?? "";
       expect(message).toContain('File "your_code.py", line 3');
       expect(message).toContain("raise ValueError('line-check')");
       expect(message).not.toContain("_pi_launcher");
@@ -231,15 +281,43 @@ describe("SandboxRunner", () => {
     });
   });
 
+  test("classifies dependency resolution before the setup milestone", async () => {
+    await withRunner(async (runner) => {
+      const result = await runner.run(
+        [
+          "# /// script",
+          '# dependencies = ["pi-code-execution-no-such-package-4d7f22"]',
+          "# ///",
+          "print('never started')",
+        ].join("\n"),
+        {},
+        undefined,
+        { timeoutSecs: 15 },
+      );
+      expect(result).toMatchObject({
+        exitCode: 1,
+        status: "setup_error",
+        stderrTruncated: false,
+        stdout: "",
+        stdoutBytes: 0,
+        stdoutTruncated: false,
+      });
+      expect(result.stderrBytes).toBeGreaterThan(0);
+      expect(result.diagnostic).toContain("could not resolve the dependencies");
+      expect(result.stdout).not.toContain("never started");
+    });
+  });
+
   test("reports a missing working directory instead of a missing uv executable", async () => {
     await withRunner(async (runner) => {
       const directory = await makeTempDir();
       await rm(directory, { recursive: true });
-      const error = await runner
-        .run("print(1)", {}, undefined, { cwd: directory })
-        .catch((cause: Error) => cause);
-      expect((error as Error).message).toContain("Python working directory is unavailable");
-      expect((error as Error).message).not.toContain("Install it");
+      const result = await runner.run("print(1)", {}, undefined, { cwd: directory });
+      expect(result.status).toBe("setup_error");
+      expect(result.diagnostic).toContain("Python working directory is unavailable");
+      expect(result.diagnostic).not.toContain("Install it");
+      expect(result.stdoutBytes).toBe(0);
+      expect(result.stderrBytes).toBe(0);
     });
   });
 
@@ -397,6 +475,34 @@ describe("SandboxRunner", () => {
     });
   });
 
+  test("classifies rejected nested calls without parsing diagnostics", async () => {
+    await withRunner(async (runner) => {
+      const result = await runner.run(
+        [
+          "try:",
+          "    await blocked()",
+          "except RuntimeError as error:",
+          "    print(str(error))",
+        ].join("\n"),
+        {
+          blocked: () => {
+            throw new NestedToolPolicyError("blocked by policy");
+          },
+        },
+      );
+      expect(result).toMatchObject({
+        diagnostic: "blocked by policy",
+        exitCode: 0,
+        status: "policy_error",
+        stderrBytes: 0,
+        stderrTruncated: false,
+        stdout: "blocked by policy\n",
+        stdoutBytes: 18,
+        stdoutTruncated: false,
+      });
+    });
+  });
+
   test("gather supports return_exceptions", async () => {
     await withRunner(async (runner) => {
       const result = await runner.run(
@@ -414,7 +520,9 @@ describe("SandboxRunner", () => {
 
   test("rejects positional tool arguments with an actionable message", async () => {
     await withRunner(async (runner) => {
-      await expect(runner.run("await ok('x')", { ok })).rejects.toThrow(/keyword arguments only/u);
+      const result = await runner.run("await ok('x')", { ok });
+      expect(result.status).toBe("runtime_error");
+      expect(result.diagnostic).toMatch(/keyword arguments only/u);
     });
   });
 
@@ -460,7 +568,15 @@ describe("SandboxRunner", () => {
         await waitForFile(pidFile);
         pid = Number(await readFile(pidFile, "utf-8"));
         controller.abort(new Error("test cancellation"));
-        await expect(run).rejects.toThrow("cancelled");
+        const result = await run;
+        expect(result.status).toBe("cancelled");
+        expect(result.diagnostic).toContain("cancelled");
+        expect(result).toMatchObject({
+          exitCode: 143,
+          stderrTruncated: false,
+          stdoutTruncated: false,
+        });
+        expectTimedOutcome(result);
         await waitForProcessExit(pid);
       } finally {
         if (pid && processExists(pid)) process.kill(pid, "SIGKILL");
@@ -476,20 +592,25 @@ describe("SandboxRunner", () => {
       const pidFile = path.join(directory, "pid");
       let pid: number | undefined;
       try {
-        await expect(
-          runner.run(
-            [
-              "import pathlib, subprocess, sys",
-              "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])",
-              `pathlib.Path(${JSON.stringify(pidFile)}).write_text(str(child.pid))`,
-              "while True:",
-              "    pass",
-            ].join("\n"),
-            {},
-            undefined,
-            { timeoutSecs: 1 },
-          ),
-        ).rejects.toThrow(/deadline/iu);
+        const result = await runner.run(
+          [
+            "import pathlib, subprocess, sys",
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])",
+            `pathlib.Path(${JSON.stringify(pidFile)}).write_text(str(child.pid))`,
+            "while True:",
+            "    pass",
+          ].join("\n"),
+          {},
+          undefined,
+          { timeoutSecs: 1 },
+        );
+        expect(result.status).toBe("timeout");
+        expect(result.diagnostic).toMatch(/deadline/iu);
+        expect(result).toMatchObject({
+          exitCode: 143,
+          stderrTruncated: false,
+          stdoutTruncated: false,
+        });
         pid = Number(await readFile(pidFile, "utf-8"));
         await waitForProcessExit(pid);
       } finally {
@@ -501,9 +622,11 @@ describe("SandboxRunner", () => {
 
   test("kills the script when it exceeds its deadline", async () => {
     await withRunner(async (runner) => {
-      await expect(
-        runner.run("while True:\n    pass", {}, undefined, { timeoutSecs: 1 }),
-      ).rejects.toThrow(/deadline/iu);
+      const result = await runner.run("while True:\n    pass", {}, undefined, {
+        timeoutSecs: 1,
+      });
+      expect(result.status).toBe("timeout");
+      expect(result.diagnostic).toMatch(/deadline/iu);
     });
   });
 
@@ -533,34 +656,47 @@ describe("SandboxRunner", () => {
 
   test("treats an ordinary user exit 124 as an ordinary failure", async () => {
     await withRunner(async (runner) => {
-      const error = await runner.run("import sys\nsys.exit(124)").catch((cause: Error) => cause);
-      expect((error as Error).message).toContain("uv exited with 124");
-      expect((error as Error).message).not.toContain("deadline");
+      const result = await runner.run("import sys\nsys.exit(124)");
+      expect(result.status).toBe("runtime_error");
+      expect(result.exitCode).toBe(124);
+      expect(result.diagnostic).toContain("uv exited with 124");
+      expect(result.diagnostic).not.toContain("deadline");
     });
   });
 
   test("hints at the PEP 723 header for a missing package", async () => {
     await withRunner(async (runner) => {
-      await expect(runner.run("import tabulate")).rejects.toThrow(
-        /Hint: The module was not found/u,
-      );
+      const result = await runner.run("import tabulate");
+      expect(result.status).toBe("runtime_error");
+      expect(result.diagnostic).toMatch(/Hint: The module was not found/u);
     });
   });
 
   test("explains how to install uv when it is missing", async () => {
     await withRunner(async (runner) => {
-      const error = await runner
-        .run("print(1)", {}, undefined, { env: { PATH: "/nonexistent" } })
-        .catch((cause: Error) => cause);
-      expect((error as Error).message).toBe(MISSING_UV_MESSAGE);
-      expect((error as Error).message).toContain("docs.astral.sh/uv");
+      const result = await runner.run("print(1)", {}, undefined, {
+        env: { PATH: "/nonexistent" },
+      });
+      expect(result).toMatchObject({
+        status: "setup_error",
+        stderrBytes: 0,
+        stderrTruncated: false,
+        stdout: "",
+        stdoutBytes: 0,
+        stdoutTruncated: false,
+      });
+      expect(result.diagnostic).toBe(MISSING_UV_MESSAGE);
+      expect(result.diagnostic).toContain("docs.astral.sh/uv");
+      expect(result.exitCode).toBeUndefined();
     });
   });
 
   test("uses the constructor uv override", async () => {
     const runner = new SandboxRunner("pi-code-execution-no-such-uv");
     try {
-      await expect(runner.run("print(1)")).rejects.toThrow("pi-code-execution-no-such-uv");
+      const result = await runner.run("print(1)");
+      expect(result.status).toBe("setup_error");
+      expect(result.diagnostic).toContain("pi-code-execution-no-such-uv");
     } finally {
       await runner.close();
     }
@@ -571,7 +707,9 @@ describe("SandboxRunner", () => {
     process.env.PI_CODE_EXECUTION_UV = "pi-code-execution-no-such-uv";
     const runner = new SandboxRunner();
     try {
-      await expect(runner.run("print(1)")).rejects.toThrow("pi-code-execution-no-such-uv");
+      const result = await runner.run("print(1)");
+      expect(result.status).toBe("setup_error");
+      expect(result.diagnostic).toContain("pi-code-execution-no-such-uv");
     } finally {
       if (previous === undefined) {
         delete process.env.PI_CODE_EXECUTION_UV;
@@ -616,7 +754,8 @@ describe("SandboxRunner", () => {
     });
     await wait(20);
     await runner.close();
-    await expect(active).rejects.toThrow("cancelled");
+    const result = await active;
+    expect(result.status).toBe("cancelled");
     expect(runSignal?.aborted).toBeTrue();
   });
 
