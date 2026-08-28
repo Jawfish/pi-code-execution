@@ -15,7 +15,11 @@ import {
   flattenToolResult,
   renderToolSignature,
 } from "./host.ts";
-import type { AnyToolDefinition } from "./host.ts";
+import type {
+  AnyToolDefinition,
+  NestedToolCall,
+  NestedToolCallOutcome,
+} from "./host.ts";
 import { buildLauncher, extractScriptBlock } from "./launcher.ts";
 import { NestedToolPolicyError } from "./runner.ts";
 
@@ -45,8 +49,24 @@ describe("bridged definitions", () => {
 
   test("collects definitions exposed by trusted extensions", () => {
     const collection = createToolCollection();
+    const before = () => undefined;
     collection.add(definition("issues"), definition("weather"));
-    expect(collection.definitions.map(({ name }) => name)).toEqual(["issues", "weather"]);
+    collection.register(definition("approved"), { before });
+    expect(collection.definitions.map(({ name }) => name)).toEqual([
+      "issues",
+      "weather",
+      "approved",
+    ]);
+    expect(
+      collection.registrations.map(({ before: handler, definition: item }) => ({
+        hasBefore: handler !== undefined,
+        name: item.name,
+      })),
+    ).toEqual([
+      { hasBefore: false, name: "issues" },
+      { hasBefore: false, name: "weather" },
+      { hasBefore: true, name: "approved" },
+    ]);
   });
 });
 
@@ -225,6 +245,110 @@ describe("createHostFunctions", () => {
     if (!executedId) throw new Error("expected executed child ID");
     expect(validAttempt.childToolCallId).toBe(executedId);
     expect(invalidAttempt.childToolCallId).not.toBe(validAttempt.childToolCallId);
+  });
+
+  test("runs async lifecycle handlers for every terminal path", async () => {
+    const outcomes: NestedToolCallOutcome[] = [];
+    const beforeCalls: NestedToolCall[] = [];
+    let executions = 0;
+    const search = definition("search");
+    search.execute = (async (_id: string, input: { query: string }) => {
+      executions += 1;
+      if (input.query === "fail") throw new TypeError("tool type failure");
+      return {
+        content: [{ text: `result:${input.query}`, type: "text" }],
+        details: {},
+      };
+    }) as AnyToolDefinition["execute"];
+    const [registration] = createPythonRegistrations([
+      {
+        after: async (call) => {
+          await Promise.resolve();
+          outcomes.push(call);
+        },
+        before: async (call) => {
+          await Promise.resolve();
+          beforeCalls.push(call);
+          if (call.input.query === "block") throw new Error("approval denied");
+        },
+        definition: search,
+      },
+    ]);
+    if (!registration) throw new Error("expected registration");
+    const hosts = createHostFunctions([registration], ctx, undefined, undefined, {
+      parentToolCallId: "outer-lifecycle",
+    });
+
+    await expect(hosts.search?.({ query: 7 })).rejects.toThrow(/Invalid arguments/u);
+    await expect(hosts.search?.({ query: "block" })).rejects.toBeInstanceOf(
+      NestedToolPolicyError,
+    );
+    await expect(hosts.search?.({ query: "fail" })).rejects.toThrow("tool type failure");
+    expect(await hosts.search?.({ query: "ok" })).toBe("result:ok");
+
+    expect(beforeCalls.map(({ input }) => input.query)).toEqual(["block", "fail", "ok"]);
+    expect(outcomes.map(({ status }) => status)).toEqual([
+      "validation_error",
+      "blocked",
+      "failed",
+      "success",
+    ]);
+    expect(outcomes.every(({ parentToolCallId }) => parentToolCallId === "outer-lifecycle"))
+      .toBeTrue();
+    expect(new Set(outcomes.map(({ childToolCallId }) => childToolCallId)).size).toBe(4);
+    expect(outcomes[1]?.error).toBeInstanceOf(NestedToolPolicyError);
+    expect((outcomes[3]?.result as { content?: unknown[] } | undefined)?.content).toHaveLength(1);
+    expect(executions).toBe(2);
+  });
+
+  test("reports cancellation to lifecycle handlers with the run signal", async () => {
+    const controller = new AbortController();
+    let beforeCall: NestedToolCall | undefined;
+    let afterCall: NestedToolCallOutcome | undefined;
+    let executionId: string | undefined;
+    let executionSignal: AbortSignal | undefined;
+    let started: (() => void) | undefined;
+    const isStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const search = definition("search");
+    search.execute = ((id: string, _input: unknown, signal: AbortSignal | undefined) => {
+      executionId = id;
+      executionSignal = signal;
+      started?.();
+      return new Promise(() => undefined);
+    }) as AnyToolDefinition["execute"];
+    const [registration] = createPythonRegistrations([
+      {
+        after: (call) => {
+          afterCall = call;
+        },
+        before: (call) => {
+          beforeCall = call;
+        },
+        definition: search,
+      },
+    ]);
+    if (!registration) throw new Error("expected registration");
+    const hosts = createHostFunctions([registration], ctx, controller.signal, undefined, {
+      parentToolCallId: "outer-cancel",
+    });
+
+    const call = Promise.resolve(hosts.search?.({ query: "wait" }));
+    await isStarted;
+    controller.abort(new Error("cancel nested call"));
+    await expect(call).rejects.toThrow("operation aborted");
+
+    if (!beforeCall || !afterCall || !executionId) {
+      throw new Error("expected complete cancellation lifecycle");
+    }
+    expect(beforeCall.signal).toBe(controller.signal);
+    expect(afterCall.signal).toBe(controller.signal);
+    expect(executionSignal).toBe(controller.signal);
+    expect(afterCall.status).toBe("cancelled");
+    expect(afterCall.childToolCallId).toBe(beforeCall.childToolCallId);
+    expect(afterCall.childToolCallId).toBe(executionId);
+    expect(afterCall.parentToolCallId).toBe("outer-cancel");
   });
 
   test("runs the preflight hook and lets it block the call", async () => {

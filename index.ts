@@ -32,7 +32,7 @@ import {
 } from "./core.ts";
 import {
   CODE_EXECUTION_COLLECT_TOOLS_EVENT,
-  createBridgedDefinitions,
+  createBridgedRegistrations,
   createHostFunctions,
   createPythonRegistrations,
   createToolCollection,
@@ -40,9 +40,9 @@ import {
   renderToolSignature,
 } from "./host.ts";
 import type {
-  AnyToolDefinition,
   NestedToolCallIdentity,
   NestedToolCallPreflight,
+  NestedToolRegistrationInput,
 } from "./host.ts";
 import {
   loadOutputArtifact,
@@ -508,7 +508,7 @@ export const createCodeExecutionTool = (
     reference: CodeArtifactReference,
   ) => Promise<LoadedCodeArtifact> = loadCodeArtifact,
   preflight?: NestedToolCallPreflight,
-  getDefinitions: () => AnyToolDefinition[] = () => [],
+  getDefinitions: () => NestedToolRegistrationInput[] = () => [],
   saveOutput: (
     spool: OutputSpool,
     toolCallId: string,
@@ -560,11 +560,12 @@ export const createCodeExecutionTool = (
     let streamedStdout = "";
     let streamedStderr = "";
     const timeoutSecs = input.timeout ?? DEFAULT_TIMEOUT_SECS;
-    const runtimeDefinitions = createBridgedDefinitions(getDefinitions());
+    const runtimeRegistrations = createBridgedRegistrations(getDefinitions());
     const activeToolNames = new Set(
-      getActiveToolNames?.() ?? runtimeDefinitions.map(({ name }) => name),
+      getActiveToolNames?.() ??
+        runtimeRegistrations.map(({ definition }) => definition.name),
     );
-    const activeRegistrations = createPythonRegistrations(runtimeDefinitions).filter(
+    const activeRegistrations = createPythonRegistrations(runtimeRegistrations).filter(
       ({ registeredName }) => activeToolNames.has(registeredName),
     );
     const toolSignatures = Object.fromEntries(
@@ -952,10 +953,10 @@ export default function codeExecutionExtension(pi: ExtensionAPI): void {
       throw new Error(event.reason ?? `Nested ${event.toolName} call blocked`);
     }
   };
-  const getDefinitions = (): AnyToolDefinition[] => {
+  const getDefinitions = (): NestedToolRegistrationInput[] => {
     const collection = createToolCollection();
     pi.events.emit(CODE_EXECUTION_COLLECT_TOOLS_EVENT, collection);
-    return collection.definitions;
+    return collection.registrations;
   };
   pi.registerTool(
     createCodeExecutionTool(
