@@ -25,6 +25,7 @@ import {
 import {
   appendLiveOutputTail,
   assembleOutput,
+  formatHeadTailOutput,
   MAX_CODE_EXECUTION_OUTPUT_BYTES,
   truncateFailureOutput,
   truncateOutput,
@@ -50,7 +51,7 @@ import type {
 } from "./output-artifacts.ts";
 import { renderOutputText, renderScriptText } from "./rendering.ts";
 import { DEFAULT_TIMEOUT_SECS, SandboxRunner } from "./runner.ts";
-import type { RunResult, RunStatus } from "./runner.ts";
+import type { OutputSpool, RunResult, RunStatus } from "./runner.ts";
 
 export {
   loadOutputArtifact,
@@ -225,6 +226,8 @@ export interface CodeExecutionOutputDetails {
   output: string;
   retainedBytes: number;
   retainedLines: number;
+  sha256: string;
+  toolCallId: string;
   truncated: boolean;
   unavailable?: boolean;
 }
@@ -355,10 +358,12 @@ Environment: runs with your full privileges in the session working directory (re
 const finalDetails = (
   result: RunResult,
   sourceRef: CodeArtifactReference,
+  outputRef?: OutputArtifactReference,
 ): CodeExecutionFinalDetails => ({
   durationMs: result.durationMs,
   ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
   nestedCalls: [],
+  ...(outputRef ? { outputRef } : {}),
   ...(result.signal === undefined ? {} : { signal: result.signal }),
   sourceRef,
   status: result.status,
@@ -376,11 +381,80 @@ const failureDiagnostics = (result: RunResult): string => {
   return `${stderr}\n\n${diagnostic}`;
 };
 
-const finalOutput = (result: RunResult): string => {
-  if (result.status === "success") {
-    return truncateOutput(assembleOutput(result.stdout, result.stderr));
+const diagnosticSupplement = (result: RunResult): string | undefined => {
+  const diagnostic = result.diagnostic?.trim();
+  if (!diagnostic) return undefined;
+  const stderr = result.stderr?.trim();
+  if (!stderr || !diagnostic.includes(stderr)) return diagnostic;
+  const supplement = diagnostic.replace(stderr, "").trim();
+  return supplement || undefined;
+};
+
+const stderrMarker = (result: RunResult): string =>
+  result.stdoutBytes > 0 && !result.stdoutEndsWithNewline
+    ? "\n[stderr]\n"
+    : "[stderr]\n";
+
+const completeTranscript = (result: RunResult): string =>
+  `${result.stdout}${result.stderrBytes > 0 ? stderrMarker(result) + (result.stderr ?? "") : ""}`;
+
+const finalOutput = (
+  result: RunResult,
+  outputRef: OutputArtifactReference | undefined,
+): string => {
+  const diagnostics = result.status === "success" ? undefined : diagnosticSupplement(result);
+  const exact =
+    result.status === "success"
+      ? assembleOutput(result.stdout, result.stderr)
+      : assembleOutput(result.stdout, failureDiagnostics(result));
+  const streamsTruncated =
+    result.outputPreview.stdout.truncated || result.outputPreview.stderr.truncated;
+  if (
+    !streamsTruncated &&
+    Buffer.byteLength(exact, "utf-8") <= MAX_CODE_EXECUTION_OUTPUT_BYTES
+  ) {
+    return exact;
   }
-  return truncateFailureOutput(assembleOutput(result.stdout, failureDiagnostics(result)));
+  if (!outputRef) {
+    return result.status === "success" ? truncateOutput(exact) : truncateFailureOutput(exact);
+  }
+
+  const marker = stderrMarker(result);
+  let head: string;
+  let tail: string;
+  let complete: string | undefined;
+  if (!streamsTruncated) {
+    complete = completeTranscript(result);
+    head = complete;
+    tail = complete;
+  } else {
+    const stdoutPreview = result.outputPreview.stdout;
+    const stderrPreview = result.outputPreview.stderr;
+    if (result.stderrBytes === 0) {
+      head = stdoutPreview.head;
+      tail = stdoutPreview.tail;
+    } else {
+      head =
+        result.stdoutBytes === 0
+          ? marker + stderrPreview.head
+          : stdoutPreview.truncated
+            ? stdoutPreview.head
+            : result.stdout + marker + stderrPreview.head;
+      tail = stderrPreview.truncated
+        ? stderrPreview.tail
+        : marker + stderrPreview.head;
+    }
+  }
+  return formatHeadTailOutput({
+    artifactTruncated: outputRef.truncated,
+    ...(complete === undefined ? {} : { complete }),
+    ...(diagnostics ? { diagnostic: diagnostics } : {}),
+    emittedBytes: outputRef.emittedBytes,
+    emittedLines: outputRef.lines,
+    head,
+    retainedBytes: outputRef.retainedBytes,
+    tail,
+  });
 };
 
 const unavailableDetails = (
@@ -430,6 +504,10 @@ export const createCodeExecutionTool = (
   ) => Promise<LoadedCodeArtifact> = loadCodeArtifact,
   preflight?: NestedToolCallPreflight,
   getDefinitions: () => AnyToolDefinition[] = () => [],
+  saveOutput: (
+    spool: OutputSpool,
+    toolCallId: string,
+  ) => Promise<OutputArtifactReference | undefined> = saveOutputArtifact,
 ): ToolDefinition<typeof parameters, CodeExecutionDetails> => ({
   description: BASE_DESCRIPTION,
   async execute(toolCallId, input, signal, onUpdate, ctx) {
@@ -472,6 +550,7 @@ export const createCodeExecutionTool = (
       artifactId = await saveArtifact(code);
     }
     const sourceRef = { ...codeSourceReference(code, toolCallId), artifactId };
+    let outputRef: OutputArtifactReference | undefined;
     let streamedStdout = "";
     let streamedStderr = "";
     const timeoutSecs = input.timeout ?? DEFAULT_TIMEOUT_SECS;
@@ -503,12 +582,20 @@ export const createCodeExecutionTool = (
           details: { sourceRef, status: "running" },
         });
       },
-      { cwd: ctx.cwd, signal, timeoutSecs, toolSignatures },
+      {
+        cwd: ctx.cwd,
+        outputSpoolConsumer: async (spool) => {
+          outputRef = await saveOutput(spool, toolCallId);
+        },
+        signal,
+        timeoutSecs,
+        toolSignatures,
+      },
     );
-    const output = finalOutput(result);
+    const output = finalOutput(result, outputRef);
     return {
       content: [{ text: output, type: "text" }],
-      details: finalDetails(result, sourceRef),
+      details: finalDetails(result, sourceRef, outputRef),
     };
   },
   executionMode: "sequential",
@@ -652,6 +739,8 @@ Pass the outputRef unchanged. Reads use UTF-8 byte offsets and return a stable c
             output: UNAVAILABLE_OUTPUT_ARTIFACT,
             retainedBytes: outputRef.retainedBytes,
             retainedLines: outputRef.retainedLines,
+            sha256: outputRef.sha256,
+            toolCallId: outputRef.toolCallId,
             truncated: outputRef.truncated,
             unavailable: true,
           },
@@ -699,6 +788,8 @@ Pass the outputRef unchanged. Reads use UTF-8 byte offsets and return a stable c
           output,
           retainedBytes: outputRef.retainedBytes,
           retainedLines: outputRef.retainedLines,
+          sha256: outputRef.sha256,
+          toolCallId: outputRef.toolCallId,
           truncated: outputRef.truncated,
         },
       };
@@ -864,6 +955,7 @@ export default function codeExecutionExtension(pi: ExtensionAPI): void {
       loadCodeArtifact,
       preflight,
       getDefinitions,
+      saveOutputArtifact,
     ),
   );
   pi.registerTool(createCodeExecutionOutputTool(loadOutputArtifact));

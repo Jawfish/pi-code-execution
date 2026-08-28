@@ -26,7 +26,6 @@ const PROCESS_STOP_GRACE_MS = 500;
 const MAX_DISPATCH_FRAME_BYTES = 32 * 1024 * 1024;
 const MAX_DISPATCH_CONNECTIONS = 4;
 const MAX_PENDING_DISPATCHES = 128;
-const WATCHDOG_MARKER_PREFIX = "__PI_CODE_EXECUTION_WATCHDOG_";
 
 const missingUvMessage = (command: string): string =>
   `code_execution needs the \`${command}\` command, which is not on PATH.
@@ -76,23 +75,32 @@ export type RunStatus =
   | "success"
   | "timeout";
 
+export interface OutputStreamPreview {
+  head: string;
+  tail: string;
+  truncated: boolean;
+}
+
 export interface RunResult {
   diagnostic?: string;
   durationMs: number;
   exitCode?: number;
   signal?: NodeJS.Signals;
+  outputPreview: {
+    stderr: OutputStreamPreview;
+    stdout: OutputStreamPreview;
+  };
   outputRetentionTruncated: boolean;
   retainedOutputBytes: number;
   status: RunStatus;
   stderr?: string;
   stderrBytes: number;
   stderrLines: number;
-  stderrPreview?: string;
   stderrTruncated: boolean;
   stdout: string;
   stdoutBytes: number;
+  stdoutEndsWithNewline: boolean;
   stdoutLines: number;
-  stdoutPreview: string;
   stdoutTruncated: boolean;
 }
 
@@ -453,7 +461,7 @@ interface SpooledStreamResult {
   bytes: number;
   endsWithNewline: boolean;
   lines: number;
-  preview: string;
+  preview: OutputStreamPreview;
   retainedBytes: number;
   text: string;
   truncated: boolean;
@@ -503,21 +511,17 @@ const decodePreviewPart = (data: Buffer, boundary: "head" | "tail"): string => {
     : decoded.replace(/^\uFFFD+/u, "");
 };
 
-const finishPreview = (
-  preview: StreamPreview,
-  stream: "stderr" | "stdout",
-  emittedBytes: number,
-): { text: string; truncated: boolean } => {
+const finishPreview = (preview: StreamPreview): OutputStreamPreview => {
   if (preview.complete !== undefined) {
-    return { text: preview.complete.toString("utf-8"), truncated: false };
+    return {
+      head: preview.complete.toString("utf-8"),
+      tail: "",
+      truncated: false,
+    };
   }
-  const head = decodePreviewPart(preview.head, "head");
-  const tail = decodePreviewPart(preview.tail, "tail");
-  const headBytes = Buffer.byteLength(head, "utf-8");
-  const tailBytes = Buffer.byteLength(tail, "utf-8");
-  const notice = `[${stream} truncated: showing the first ${headBytes} and last ${tailBytes} of ${emittedBytes} bytes]`;
   return {
-    text: [head, notice, tail].filter(Boolean).join("\n"),
+    head: decodePreviewPart(preview.head, "head"),
+    tail: decodePreviewPart(preview.tail, "tail"),
     truncated: true,
   };
 };
@@ -538,7 +542,6 @@ const appendLegacyCapture = (
 /** Drain, count, spool, and preview one raw process stream. */
 const readSpooledStream = async (
   stream: NodeJS.ReadableStream,
-  streamName: "stderr" | "stdout",
   spool: FileHandle,
   maxPreviewBytes: number,
   legacyRetention: "head" | "tail",
@@ -578,7 +581,7 @@ const readSpooledStream = async (
     bytes,
     endsWithNewline: lastByte === 0x0a,
     lines,
-    preview: finishPreview(preview, streamName, bytes).text,
+    preview: finishPreview(preview),
     retainedBytes,
     text,
     truncated: captured.length < bytes,
@@ -664,7 +667,11 @@ export class SandboxRunner {
     let stderrEndsWithNewline = false;
     let stderrLines = 0;
     let stderrPath: string | undefined;
-    let stderrPreview = "";
+    let stderrPreview: OutputStreamPreview = {
+      head: "",
+      tail: "",
+      truncated: false,
+    };
     let stderrRetainedBytes = 0;
     let stderrSpool: FileHandle | undefined;
     let stderrTruncated = false;
@@ -673,7 +680,11 @@ export class SandboxRunner {
     let stdoutEndsWithNewline = false;
     let stdoutLines = 0;
     let stdoutPath: string | undefined;
-    let stdoutPreview = "";
+    let stdoutPreview: OutputStreamPreview = {
+      head: "",
+      tail: "",
+      truncated: false,
+    };
     let stdoutRetainedBytes = 0;
     let stdoutSpool: FileHandle | undefined;
     let stdoutTruncated = false;
@@ -685,18 +696,18 @@ export class SandboxRunner {
       ...(diagnostic ? { diagnostic } : {}),
       durationMs: performance.now() - startedAt,
       ...processExit,
+      outputPreview: { stderr: stderrPreview, stdout: stdoutPreview },
       outputRetentionTruncated,
       retainedOutputBytes,
       status,
       ...(stderr ? { stderr } : {}),
       stderrBytes,
       stderrLines,
-      ...(stderrPreview ? { stderrPreview } : {}),
       stderrTruncated,
       stdout,
       stdoutBytes,
+      stdoutEndsWithNewline,
       stdoutLines,
-      stdoutPreview,
       stdoutTruncated,
     });
 
@@ -709,12 +720,12 @@ export class SandboxRunner {
       const scriptPath = path.join(directory, USER_SCRIPT_NAME);
       const launcherPath = path.join(directory, "_pi_launcher.py");
       const setupMarkerPath = path.join(directory, "setup-complete");
+      const watchdogPath = path.join(directory, "watchdog-expired");
       stdoutPath = path.join(directory, "stdout.spool");
       stderrPath = path.join(directory, "stderr.spool");
       stdoutSpool = await open(stdoutPath, "wx", 0o600);
       stderrSpool = await open(stderrPath, "wx", 0o600);
       const token = randomBytes(32).toString("base64url");
-      const watchdogMarker = `${WATCHDOG_MARKER_PREFIX}${randomBytes(16).toString("hex")}__`;
       await writeFile(scriptPath, code, "utf-8");
       await writeFile(launcherPath, buildLauncher(code), "utf-8");
       throwIfAborted();
@@ -729,7 +740,7 @@ export class SandboxRunner {
           PI_SETUP_MARKER: setupMarkerPath,
           PI_TOOL_NAMES: JSON.stringify(Object.keys(tools)),
           PI_TOOL_SIGNATURES: JSON.stringify(options.toolSignatures ?? {}),
-          PI_WATCHDOG_MARKER: watchdogMarker,
+          PI_WATCHDOG_PATH: watchdogPath,
         },
         launcherPath,
         scriptPath,
@@ -760,7 +771,6 @@ export class SandboxRunner {
         if (!stdoutSpool) throw new Error("stdout spool is unavailable");
         const captured = await readSpooledStream(
           child.stdout,
-          "stdout",
           stdoutSpool,
           maxStdoutBytes,
           "head",
@@ -781,7 +791,6 @@ export class SandboxRunner {
         if (!stderrSpool) throw new Error("stderr spool is unavailable");
         const captured = await readSpooledStream(
           child.stderr,
-          "stderr",
           stderrSpool,
           maxStderrBytes,
           "tail",
@@ -823,10 +832,10 @@ export class SandboxRunner {
       if (streamError !== undefined) {
         throw streamError;
       }
-      const watchdogTimedOut = stderr.includes(watchdogMarker);
-      if (watchdogTimedOut) {
-        stderr = stderr.replace(watchdogMarker, "");
-      }
+      const watchdogTimedOut = await stat(watchdogPath).then(
+        (metadata) => metadata.isFile(),
+        () => false,
+      );
       if (stdoutTruncated) {
         stdout = `[stdout truncated: showing the first ${Buffer.byteLength(stdout, "utf-8")} of ${stdoutBytes} bytes]\n${stdout}`;
       }

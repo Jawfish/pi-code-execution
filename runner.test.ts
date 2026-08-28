@@ -181,12 +181,14 @@ describe("SandboxRunner", () => {
       expect(result).toMatchObject({
         outputRetentionTruncated: false,
         retainedOutputBytes: 20,
+        outputPreview: {
+          stderr: { head: "warn\nlast\n", tail: "", truncated: false },
+          stdout: { head: "alpha\nbeta", tail: "", truncated: false },
+        },
         stderrBytes: 10,
         stderrLines: 2,
-        stderrPreview: "warn\nlast\n",
         stdoutBytes: 10,
         stdoutLines: 2,
-        stdoutPreview: "alpha\nbeta",
       });
       for (const file of spoolPaths) {
         await expect(stat(file)).rejects.toThrow();
@@ -231,10 +233,17 @@ describe("SandboxRunner", () => {
         stdoutLines: 1,
         stdoutTruncated: true,
       });
-      expect(result.stdoutPreview).toStartWith("HEAD-");
-      expect(result.stdoutPreview).toContain("showing the first 10 and last 10 of 110 bytes");
-      expect(result.stdoutPreview).toEndWith("-TAIL");
-      expect(Buffer.byteLength(result.stdoutPreview, "utf-8")).toBeLessThan(140);
+      expect(result.outputPreview.stdout).toEqual({
+        head: "HEAD-xxxxx",
+        tail: "xxxxx-TAIL",
+        truncated: true,
+      });
+      expect(
+        Buffer.byteLength(
+          result.outputPreview.stdout.head + result.outputPreview.stdout.tail,
+          "utf-8",
+        ),
+      ).toBeLessThanOrEqual(20);
     });
   });
 
@@ -894,9 +903,9 @@ describe("SandboxRunner", () => {
     });
   });
 
-  test("removes the private watchdog marker from the script environment", async () => {
+  test("removes the private watchdog path from the script environment", async () => {
     await withRunner(async (runner) => {
-      const result = await runner.run("import os\nprint('PI_WATCHDOG_MARKER' in os.environ)");
+      const result = await runner.run("import os\nprint('PI_WATCHDOG_PATH' in os.environ)");
       expect(result.stdout).toBe("False\n");
     });
   });

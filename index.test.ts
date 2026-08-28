@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -11,6 +11,7 @@ import { codeSourceReference } from "./context.ts";
 import {
   appendLiveOutputTail,
   assembleOutput,
+  formatHeadTailOutput,
   NO_OUTPUT,
   truncateFailureOutput,
   truncateOutput,
@@ -20,7 +21,7 @@ import {
   codeExecutionResultOverride,
   createCodeExecutionOutputTool,
   createCodeExecutionSourceTool,
-  createCodeExecutionTool,
+  createCodeExecutionTool as createProductionCodeExecutionTool,
   executeForTest,
   readOutputForTest,
   readSourceForTest,
@@ -68,6 +69,43 @@ const retainOutput = async (
 const artifactId = "0123456789abcdef.py";
 const saveTestArtifact = (code: string): Promise<string> => Promise.resolve(codeArtifactId(code));
 
+type CreateToolParameters = Parameters<typeof createProductionCodeExecutionTool>;
+const createCodeExecutionTool = (
+  runner: CreateToolParameters[0],
+  saveArtifact: CreateToolParameters[1] = saveTestArtifact,
+  getActiveToolNames?: CreateToolParameters[2],
+  loadArtifact?: CreateToolParameters[3],
+  preflight?: CreateToolParameters[4],
+  getDefinitions?: CreateToolParameters[5],
+) =>
+  createProductionCodeExecutionTool(
+    runner,
+    saveArtifact,
+    getActiveToolNames,
+    loadArtifact,
+    preflight,
+    getDefinitions,
+    () => Promise.resolve(undefined),
+  );
+
+const createArtifactCodeExecutionTool = (
+  runner: SandboxRunner,
+  sourceRoot: string,
+  outputRoot: string,
+  getActiveToolNames?: CreateToolParameters[2],
+  preflight?: CreateToolParameters[4],
+  getDefinitions?: CreateToolParameters[5],
+) =>
+  createProductionCodeExecutionTool(
+    runner,
+    (code) => saveCodeArtifact(code, sourceRoot),
+    getActiveToolNames,
+    (reference) => loadCodeArtifact(reference, sourceRoot),
+    preflight,
+    getDefinitions,
+    (spool, toolCallId) => saveOutputArtifact(spool, toolCallId, outputRoot),
+  );
+
 const expectFinalDetails = (details: CodeExecutionDetails): CodeExecutionFinalDetails => {
   expect(details.status).not.toBe("running");
   if (details.status === "running") throw new Error("expected final code execution details");
@@ -112,6 +150,25 @@ describe("output formatting", () => {
     expect(Buffer.byteLength(output, "utf-8")).toBeLessThanOrEqual(14);
     expect(output).toEndWith("gamma\ndelta\n");
     expect(output).not.toContain("alpha");
+  });
+
+  test("renders bounded head-tail metadata and artifact recovery", () => {
+    const output = formatHeadTailOutput({
+      artifactTruncated: true,
+      diagnostic: "RuntimeError: tail-visible",
+      emittedBytes: 100_000,
+      emittedLines: 200,
+      head: "head\n".repeat(3000),
+      retainedBytes: 64_000,
+      tail: "tail\n".repeat(3000),
+    });
+    expect(Buffer.byteLength(output, "utf-8")).toBeLessThanOrEqual(20 * 1024);
+    expect(output).toStartWith("head");
+    expect(output).toContain("omitted");
+    expect(output).toContain("100000 emitted bytes across 200 lines");
+    expect(output).toContain("64000 of 100000 emitted bytes");
+    expect(output).toContain("36000 bytes cannot be recovered");
+    expect(output).toEndWith("RuntimeError: tail-visible");
   });
 
   test("keeps both failure output and its diagnostic tail", () => {
@@ -595,6 +652,217 @@ describe("code_execution tool", () => {
       await runner.close();
     }
   });
+
+  test("attaches output artifacts and reconstructs mixed output exactly", async () => {
+    const dir = await tempDir();
+    const sourceRoot = path.join(dir, "sources");
+    const outputRoot = path.join(dir, "outputs");
+    const runner = new SandboxRunner();
+    const tool = createArtifactCodeExecutionTool(runner, sourceRoot, outputRoot);
+    const stdout = `HEAD-${"x".repeat(30_000)}-STDOUT-TAIL\n`;
+    const stderr = "STDERR-TAIL\n";
+    const code = [
+      "import sys",
+      `sys.stdout.write(${JSON.stringify(stdout)})`,
+      "sys.stdout.flush()",
+      `sys.stderr.write(${JSON.stringify(stderr)})`,
+      "sys.stderr.flush()",
+    ].join("\n");
+    try {
+      const result = await tool.execute(
+        "mixed-artifact",
+        { code },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      const details = expectFinalDetails(result.details);
+      const outputRef = details.outputRef;
+      expect(outputRef).toBeDefined();
+      if (!outputRef) throw new Error("expected outputRef");
+      const expected = `${stdout}[stderr]\n${stderr}`;
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(20 * 1024);
+      expect(text).toStartWith("HEAD-");
+      expect(text).toContain("STDERR-TAIL");
+      expect(text).toContain(
+        `${Buffer.byteLength(expected, "utf-8")} emitted bytes across 3 lines`,
+      );
+      expect(text).toContain("code_execution_output using outputRef");
+      expect(details).toMatchObject({
+        outputRef: {
+          emittedBytes: Buffer.byteLength(expected, "utf-8"),
+          lines: 3,
+          retainedBytes: Buffer.byteLength(expected, "utf-8"),
+          toolCallId: "mixed-artifact",
+          truncated: false,
+        },
+        sourceRef: codeSourceReference(code, "mixed-artifact"),
+        status: "success",
+      });
+      expect(JSON.stringify(details)).not.toContain(dir);
+
+      const outputTool = createCodeExecutionOutputTool((reference) =>
+        loadOutputArtifact(reference, outputRoot),
+      );
+      const chunks: string[] = [];
+      let offset = 0;
+      for (;;) {
+        const page = await readOutputForTest(
+          outputTool,
+          { offset, outputRef },
+          { cwd: dir } as ExtensionContext,
+        );
+        chunks.push(page.details?.chunk ?? "");
+        if (page.details?.nextOffset === undefined) break;
+        offset = page.details.nextOffset;
+      }
+      expect(chunks.join("")).toBe(expected);
+
+      await rm(path.join(outputRoot, outputRef.artifactId));
+      const replay = await tool.execute(
+        "mixed-replay",
+        { sourceRef: details.sourceRef },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(expectFinalDetails(replay.details)).toMatchObject({
+        outputRef: { toolCallId: "mixed-replay" },
+        sourceRef: { toolCallId: "mixed-replay" },
+        status: "success",
+      });
+
+      const empty = await tool.execute(
+        "empty-output",
+        { code: "value = 1" },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(empty.content[0]).toEqual({ text: NO_OUTPUT, type: "text" });
+      expect(expectFinalDetails(empty.details).outputRef).toBeUndefined();
+
+      const stderrOnly = await tool.execute(
+        "stderr-only",
+        { code: "import sys\nprint('warning only', file=sys.stderr)" },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      const stderrOnlyRef = expectFinalDetails(stderrOnly.details).outputRef;
+      if (!stderrOnlyRef) throw new Error("expected stderr outputRef");
+      const stderrArtifact = await loadOutputArtifact(stderrOnlyRef, outputRoot);
+      try {
+        expect(await stderrArtifact.handle.readFile("utf-8")).toBe(
+          "[stderr]\nwarning only\n",
+        );
+      } finally {
+        await stderrArtifact.handle.close();
+      }
+    } finally {
+      await runner.close();
+    }
+  });
+
+  test("attaches output artifacts to expected failures", async () => {
+    const dir = await tempDir();
+    const sourceRoot = path.join(dir, "sources");
+    const outputRoot = path.join(dir, "outputs");
+    const runner = new SandboxRunner();
+    const tool = createArtifactCodeExecutionTool(runner, sourceRoot, outputRoot);
+    try {
+      const runtime = await tool.execute(
+        "artifact-runtime",
+        { code: "print('before failure', flush=True)\nraise RuntimeError('boom')" },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(expectFinalDetails(runtime.details)).toMatchObject({
+        outputRef: { toolCallId: "artifact-runtime" },
+        status: "runtime_error",
+      });
+      expect(runtime.content[0]?.type === "text" && runtime.content[0].text).toContain(
+        "RuntimeError: boom",
+      );
+
+      const timeout = await tool.execute(
+        "artifact-timeout",
+        { code: "print('before timeout', flush=True)\nwhile True:\n    pass", timeout: 1 },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(expectFinalDetails(timeout.details)).toMatchObject({
+        outputRef: { toolCallId: "artifact-timeout" },
+        status: "timeout",
+      });
+
+      const controller = new AbortController();
+      const cancelled = await tool.execute(
+        "artifact-cancelled",
+        { code: "import time\nprint('before cancel', flush=True)\ntime.sleep(30)" },
+        controller.signal,
+        (update) => {
+          if (
+            update.content.some(
+              (item) => item.type === "text" && item.text.includes("before cancel"),
+            )
+          ) {
+            controller.abort(new Error("cancel artifact test"));
+          }
+        },
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(expectFinalDetails(cancelled.details)).toMatchObject({
+        outputRef: { toolCallId: "artifact-cancelled" },
+        status: "cancelled",
+      });
+    } finally {
+      await runner.close();
+    }
+  });
+
+  test("marks output beyond the default retention ceiling", async () => {
+    const dir = await tempDir();
+    const runner = new SandboxRunner();
+    const tool = createArtifactCodeExecutionTool(
+      runner,
+      path.join(dir, "sources"),
+      path.join(dir, "outputs"),
+    );
+    const emittedBytes = 64 * 1024 * 1024 + 1;
+    try {
+      const result = await tool.execute(
+        "artifact-ceiling",
+        {
+          code: `import sys\nsys.stdout.buffer.write(b'x' * ${emittedBytes})\nsys.stdout.flush()`,
+          timeout: 30,
+        },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      const details = expectFinalDetails(result.details);
+      expect(details.outputRef).toMatchObject({
+        emittedBytes,
+        retainedBytes: 64 * 1024 * 1024,
+        toolCallId: "artifact-ceiling",
+        truncated: true,
+      });
+      if (!details.outputRef) throw new Error("expected ceiling outputRef");
+      expect((await stat(path.join(dir, "outputs", details.outputRef.artifactId))).size).toBe(
+        64 * 1024 * 1024,
+      );
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(20 * 1024);
+      expect(text).toContain("Output artifact truncated");
+      expect(text).toContain("1 bytes cannot be recovered");
+    } finally {
+      await runner.close();
+    }
+  }, 40_000);
 
   test("returns retained output and complete runtime details", async () => {
     const dir = await tempDir();
