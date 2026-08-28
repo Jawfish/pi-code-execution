@@ -16,7 +16,7 @@ import {
   truncateFailureOutput,
   truncateOutput,
 } from "./core.ts";
-import type { AnyToolDefinition } from "./host.ts";
+import type { AnyToolDefinition, NestedToolCall } from "./host.ts";
 import {
   codeExecutionResultOverride,
   createCodeExecutionOutputTool,
@@ -356,6 +356,103 @@ describe("code_execution tool", () => {
         text: "search_issues(query: str) -> str\nsearch_issues:bug",
         type: "text",
       });
+    } finally {
+      await runner.close();
+    }
+  });
+
+  test("keeps parent, child, registered, and Python tool identities", async () => {
+    const dir = await tempDir();
+    const runner = new SandboxRunner();
+    const executed = new Map<string, string>();
+    const policyCalls: NestedToolCall[] = [];
+    const nestedDefinition = (name: string, delayMs: number): AnyToolDefinition =>
+      ({
+        description: name,
+        execute: async (id: string, input: { query: string }) => {
+          executed.set(name, id);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          return {
+            content: [{ text: `${name}:${input.query}`, type: "text" }],
+            details: {},
+          };
+        },
+        label: name,
+        name,
+        parameters: Type.Object({ query: Type.String() }),
+      }) as AnyToolDefinition;
+    const definitions = [
+      nestedDefinition("Kagi/search", 40),
+      nestedDefinition("Kagi.search", 5),
+      nestedDefinition("open", 1),
+    ];
+    const tool = createCodeExecutionTool(
+      runner,
+      saveTestArtifact,
+      () => definitions.map(({ name }) => name),
+      undefined,
+      (call) => {
+        policyCalls.push(call);
+      },
+      () => definitions,
+    );
+    try {
+      const result = await tool.execute(
+        "identity-parent",
+        {
+          code: [
+            "import asyncio",
+            "values = await asyncio.gather(",
+            "    Kagi_search(query='slow'),",
+            "    Kagi_search_2(query='fast'),",
+            "    tool_open(query='reserved'),",
+            ")",
+            "print('|'.join(values))",
+          ].join("\n"),
+        },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(result.content[0]).toEqual({
+        text: "Kagi/search:slow|Kagi.search:fast|open:reserved",
+        type: "text",
+      });
+      const nestedCalls = expectFinalDetails(result.details).nestedCalls;
+      expect(nestedCalls.map(({ registeredName }) => registeredName)).toEqual([
+        "Kagi/search",
+        "Kagi.search",
+        "open",
+      ]);
+      expect(nestedCalls.map(({ pythonName }) => pythonName)).toEqual([
+        "Kagi_search",
+        "Kagi_search_2",
+        "tool_open",
+      ]);
+      expect(nestedCalls.every(({ parentToolCallId }) => parentToolCallId === "identity-parent"))
+        .toBeTrue();
+      expect(new Set(nestedCalls.map(({ childToolCallId }) => childToolCallId)).size).toBe(3);
+      for (const call of nestedCalls) {
+        const executedId = executed.get(call.registeredName);
+        if (!executedId) throw new Error(`missing execution ID for ${call.registeredName}`);
+        expect(call.childToolCallId).toBe(executedId);
+      }
+      expect(
+        policyCalls.map(
+          ({ childToolCallId, parentToolCallId, pythonName, registeredName, toolName }) => ({
+            childToolCallId,
+            parentToolCallId,
+            pythonName,
+            registeredName,
+            toolName,
+          }),
+        ),
+      ).toEqual(
+        nestedCalls.map((call) => ({
+          ...call,
+          toolName: call.registeredName,
+        })),
+      );
     } finally {
       await runner.close();
     }

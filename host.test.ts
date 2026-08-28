@@ -10,6 +10,7 @@ import {
   createBridgedDefinitions,
   createHostFunctions,
   createPythonDefinitions,
+  createPythonRegistrations,
   createToolCollection,
   flattenToolResult,
   renderToolSignature,
@@ -72,12 +73,25 @@ describe("createPythonDefinitions", () => {
   });
 
   test("makes non-identifier names callable and keeps them unique", () => {
-    const renamed = createPythonDefinitions([
+    const definitions = [
       definition("Kagi/search"),
       definition("Kagi.search"),
       definition("2fast"),
-    ]).map((tool) => tool.name);
-    expect(renamed).toEqual(["Kagi_search", "Kagi_search_2", "_2fast"]);
+    ];
+    const registrations = createPythonRegistrations(definitions);
+    expect(
+      registrations.map(({ pythonName, registeredName }) => ({ pythonName, registeredName })),
+    ).toEqual([
+      { pythonName: "Kagi_search", registeredName: "Kagi/search" },
+      { pythonName: "Kagi_search_2", registeredName: "Kagi.search" },
+      { pythonName: "_2fast", registeredName: "2fast" },
+    ]);
+    expect(registrations.map(({ definition: item }) => item)).toEqual(definitions);
+    expect(createPythonDefinitions(definitions).map((tool) => tool.name)).toEqual([
+      "Kagi_search",
+      "Kagi_search_2",
+      "_2fast",
+    ]);
   });
 });
 
@@ -155,6 +169,62 @@ describe("createHostFunctions", () => {
     await expect(hosts.search?.({ nope: "x", query: "y" })).rejects.toThrow(
       /unknown property nope/u,
     );
+  });
+
+  test("allocates stable identities before validation and policy", async () => {
+    const search = definition("Kagi/search");
+    let executedId: string | undefined;
+    search.execute = ((id: string, input: { query: string }) => {
+      executedId = id;
+      return Promise.resolve({
+        content: [{ text: input.query, type: "text" }],
+        details: {},
+      });
+    }) as AnyToolDefinition["execute"];
+    const [registration] = createPythonRegistrations([search]);
+    if (!registration) throw new Error("expected registration");
+    const attempts: Array<{
+      childToolCallId: string;
+      parentToolCallId: string;
+      pythonName: string;
+      registeredName: string;
+    }> = [];
+    const policies: typeof attempts = [];
+    const hosts = createHostFunctions(
+      [registration],
+      ctx,
+      undefined,
+      (call) => {
+        policies.push(call);
+      },
+      {
+        onCall: (call) => attempts.push(call),
+        parentToolCallId: "outer-call",
+      },
+    );
+
+    await expect(hosts.Kagi_search?.({ query: 7 })).rejects.toThrow(
+      /Invalid arguments for Kagi\/search/u,
+    );
+    expect(attempts).toHaveLength(1);
+    expect(policies).toHaveLength(0);
+
+    expect(await hosts.Kagi_search?.({ query: "ok" })).toBe("ok");
+    expect(attempts).toHaveLength(2);
+    expect(policies).toEqual([
+      expect.objectContaining(attempts[1] ?? {}),
+    ]);
+    const invalidAttempt = attempts[0];
+    const validAttempt = attempts[1];
+    if (!invalidAttempt || !validAttempt) throw new Error("expected attempts");
+    expect(validAttempt).toMatchObject({
+      parentToolCallId: "outer-call",
+      pythonName: "Kagi_search",
+      registeredName: "Kagi/search",
+    });
+    if (!executedId) throw new Error("expected executed child ID");
+    expect(validAttempt.childToolCallId).toBe(executedId);
+    expect(invalidAttempt.childToolCallId).not.toBe(validAttempt.childToolCallId);
   });
 
   test("runs the preflight hook and lets it block the call", async () => {

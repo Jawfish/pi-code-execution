@@ -34,12 +34,16 @@ import {
   CODE_EXECUTION_COLLECT_TOOLS_EVENT,
   createBridgedDefinitions,
   createHostFunctions,
-  createPythonDefinitions,
+  createPythonRegistrations,
   createToolCollection,
   MAX_RECOVERED_TOOL_OUTPUT_BYTES,
   renderToolSignature,
 } from "./host.ts";
-import type { AnyToolDefinition, NestedToolCallPreflight } from "./host.ts";
+import type {
+  AnyToolDefinition,
+  NestedToolCallIdentity,
+  NestedToolCallPreflight,
+} from "./host.ts";
 import {
   loadOutputArtifact,
   OutputArtifactUnavailableError,
@@ -193,7 +197,7 @@ export type CodeExecutionInput = Static<typeof parameters>;
 export type CodeExecutionOutputInput = Static<typeof outputParameters>;
 export type CodeExecutionSourceInput = Static<typeof sourceParameters>;
 
-export type NestedToolCallRecord = Record<string, unknown>;
+export type NestedToolCallRecord = NestedToolCallIdentity;
 
 export interface CodeExecutionFinalDetails {
   durationMs: number;
@@ -358,11 +362,12 @@ Environment: runs with your full privileges in the session working directory (re
 const finalDetails = (
   result: RunResult,
   sourceRef: CodeArtifactReference,
+  nestedCalls: NestedToolCallRecord[],
   outputRef?: OutputArtifactReference,
 ): CodeExecutionFinalDetails => ({
   durationMs: result.durationMs,
   ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
-  nestedCalls: [],
+  nestedCalls,
   ...(outputRef ? { outputRef } : {}),
   ...(result.signal === undefined ? {} : { signal: result.signal }),
   sourceRef,
@@ -551,6 +556,7 @@ export const createCodeExecutionTool = (
     }
     const sourceRef = { ...codeSourceReference(code, toolCallId), artifactId };
     let outputRef: OutputArtifactReference | undefined;
+    const nestedCalls: NestedToolCallRecord[] = [];
     let streamedStdout = "";
     let streamedStderr = "";
     const timeoutSecs = input.timeout ?? DEFAULT_TIMEOUT_SECS;
@@ -558,18 +564,22 @@ export const createCodeExecutionTool = (
     const activeToolNames = new Set(
       getActiveToolNames?.() ?? runtimeDefinitions.map(({ name }) => name),
     );
-    const activeDefinitions = createPythonDefinitions(runtimeDefinitions).filter(
-      (_definition, index) => activeToolNames.has(runtimeDefinitions[index]?.name ?? ""),
+    const activeRegistrations = createPythonRegistrations(runtimeDefinitions).filter(
+      ({ registeredName }) => activeToolNames.has(registeredName),
     );
     const toolSignatures = Object.fromEntries(
-      activeDefinitions.map((definition) => [
-        definition.name,
-        renderToolSignature(definition).replace(/^- /u, ""),
+      activeRegistrations.map(({ definition, pythonName }) => [
+        pythonName,
+        renderToolSignature({ ...definition, name: pythonName }).replace(/^- /u, ""),
       ]),
     );
     const result = await runner.run(
       code,
-      (runSignal) => createHostFunctions(activeDefinitions, ctx, runSignal, preflight),
+      (runSignal) =>
+        createHostFunctions(activeRegistrations, ctx, runSignal, preflight, {
+          onCall: (identity) => nestedCalls.push(identity),
+          parentToolCallId: toolCallId,
+        }),
       ({ stream, text }) => {
         if (stream === "stdout") {
           streamedStdout = appendLiveOutputTail(streamedStdout, text, MAX_LIVE_STREAM_BYTES);
@@ -595,7 +605,7 @@ export const createCodeExecutionTool = (
     const output = finalOutput(result, outputRef);
     return {
       content: [{ text: output, type: "text" }],
-      details: finalDetails(result, sourceRef, outputRef),
+      details: finalDetails(result, sourceRef, nestedCalls, outputRef),
     };
   },
   executionMode: "sequential",
