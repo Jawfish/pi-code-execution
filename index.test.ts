@@ -448,11 +448,234 @@ describe("code_execution tool", () => {
           }),
         ),
       ).toEqual(
-        nestedCalls.map((call) => ({
-          ...call,
-          toolName: call.registeredName,
-        })),
+        nestedCalls.map(
+          ({ childToolCallId, parentToolCallId, pythonName, registeredName }) => ({
+            childToolCallId,
+            parentToolCallId,
+            pythonName,
+            registeredName,
+            toolName: registeredName,
+          }),
+        ),
       );
+    } finally {
+      await runner.close();
+    }
+  });
+
+  test("records bounded nested outcomes and aggregates usage once", async () => {
+    const dir = await tempDir();
+    const runner = new SandboxRunner();
+    const sideEffects: string[] = [];
+    const usage = (factor: number) => ({
+      cacheRead: 3 * factor,
+      cacheWrite: 4 * factor,
+      cacheWrite1h: 5 * factor,
+      cost: {
+        cacheRead: 0.03 * factor,
+        cacheWrite: 0.04 * factor,
+        input: 0.01 * factor,
+        output: 0.02 * factor,
+        total: 0.1 * factor,
+      },
+      input: factor,
+      output: 2 * factor,
+      reasoning: 6 * factor,
+      totalTokens: 10 * factor,
+    });
+    const nestedDefinition = (
+      name: string,
+      delayMs: number,
+      execute: (input: { payload: string }) => Promise<string>,
+      nestedUsage?: ReturnType<typeof usage>,
+    ): AnyToolDefinition =>
+      ({
+        description: name,
+        execute: async (_id: string, input: { payload: string }) => {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          const text = await execute(input);
+          return {
+            content: [{ text, type: "text" }],
+            details: {},
+            ...(nestedUsage ? { usage: nestedUsage } : {}),
+          };
+        },
+        label: name,
+        name,
+        parameters: Type.Object({ payload: Type.String() }),
+      }) as AnyToolDefinition;
+    const definitions = [
+      nestedDefinition(
+        "mutate",
+        30,
+        async ({ payload }) => {
+          sideEffects.push("mutated");
+          return `mutated:${payload}`;
+        },
+        usage(1),
+      ),
+      nestedDefinition("meter", 5, async ({ payload }) => `metered:${payload}`, usage(2)),
+      nestedDefinition("fail", 1, async ({ payload }) => {
+        throw new Error(`nested failure:${payload}`);
+      }),
+    ];
+    const tool = createCodeExecutionTool(
+      runner,
+      saveTestArtifact,
+      () => definitions.map(({ name }) => name),
+      undefined,
+      undefined,
+      () => definitions,
+    );
+    try {
+      const result = await tool.execute(
+        "nested-outcomes",
+        {
+          code: [
+            "import asyncio",
+            "payload = '🙂' * 2000",
+            "await asyncio.gather(",
+            "    mutate(payload=payload),",
+            "    meter(payload=payload),",
+            ")",
+            "try:",
+            "    await meter(payload=7)",
+            "except RuntimeError:",
+            "    pass",
+            "try:",
+            "    await fail(payload='z' * 5000)",
+            "except RuntimeError:",
+            "    pass",
+            "raise RuntimeError('outer failure after side effects')",
+          ].join("\n"),
+        },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(expectFinalDetails(result.details).status).toBe("runtime_error");
+      expect(sideEffects).toEqual(["mutated"]);
+      const calls = expectFinalDetails(result.details).nestedCalls;
+      expect(calls.map(({ registeredName }) => registeredName)).toEqual([
+        "mutate",
+        "meter",
+        "meter",
+        "fail",
+      ]);
+      expect(calls.map(({ status }) => status)).toEqual([
+        "success",
+        "success",
+        "validation_error",
+        "failed",
+      ]);
+      expect(calls.every(({ durationMs }) => durationMs >= 0 && Number.isFinite(durationMs)))
+        .toBeTrue();
+      expect(calls.every(({ startedAt }) => !Number.isNaN(Date.parse(startedAt)))).toBeTrue();
+      expect(calls[0]?.inputPreview).toMatchObject({ truncated: true });
+      expect(calls[0]?.resultPreview).toMatchObject({ truncated: true });
+      expect(calls[3]?.errorPreview).toMatchObject({ truncated: true });
+      for (const call of calls) {
+        expect(Buffer.byteLength(call.inputPreview.text, "utf-8")).toBeLessThanOrEqual(4096);
+        if (call.resultPreview) {
+          expect(Buffer.byteLength(call.resultPreview.text, "utf-8")).toBeLessThanOrEqual(4096);
+        }
+        if (call.errorPreview) {
+          expect(Buffer.byteLength(call.errorPreview.text, "utf-8")).toBeLessThanOrEqual(4096);
+        }
+      }
+      expect(calls[0]?.usage).toEqual(usage(1));
+      expect(calls[1]?.usage).toEqual(usage(2));
+      expect(calls[2]?.usage).toBeUndefined();
+      expect(calls[3]?.usage).toBeUndefined();
+      expect(result.usage).toEqual(usage(3));
+    } finally {
+      await runner.close();
+    }
+  });
+
+  test("keeps active nested records on timeout and cancellation", async () => {
+    const dir = await tempDir();
+    const runner = new SandboxRunner();
+    let started: (() => void) | undefined;
+    let nestedStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const quick = definition("quick");
+    const slow = {
+      ...definition("slow"),
+      execute: (() => {
+        started?.();
+        return new Promise(() => undefined);
+      }) as AnyToolDefinition["execute"],
+    } as AnyToolDefinition;
+    const tool = createCodeExecutionTool(
+      runner,
+      saveTestArtifact,
+      () => ["quick", "slow"],
+      undefined,
+      undefined,
+      () => [quick, slow],
+    );
+    try {
+      const timeout = await tool.execute(
+        "nested-timeout",
+        {
+          code: "await quick(query='done')\nawait slow(query='wait')",
+          timeout: 1,
+        },
+        undefined,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      expect(expectFinalDetails(timeout.details)).toMatchObject({
+        nestedCalls: [
+          {
+            parentToolCallId: "nested-timeout",
+            registeredName: "quick",
+            status: "success",
+          },
+          {
+            parentToolCallId: "nested-timeout",
+            registeredName: "slow",
+            status: "cancelled",
+          },
+        ],
+        status: "timeout",
+      });
+
+      started = undefined;
+      nestedStarted = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const controller = new AbortController();
+      const cancelledPromise = tool.execute(
+        "nested-cancelled",
+        {
+          code: "await quick(query='done')\nawait slow(query='wait')",
+          timeout: 30,
+        },
+        controller.signal,
+        undefined,
+        { cwd: dir } as ExtensionContext,
+      );
+      await nestedStarted;
+      controller.abort(new Error("cancel nested integration"));
+      const cancelled = await cancelledPromise;
+      expect(expectFinalDetails(cancelled.details)).toMatchObject({
+        nestedCalls: [
+          {
+            parentToolCallId: "nested-cancelled",
+            registeredName: "quick",
+            status: "success",
+          },
+          {
+            parentToolCallId: "nested-cancelled",
+            registeredName: "slow",
+            status: "cancelled",
+          },
+        ],
+        status: "cancelled",
+      });
     } finally {
       await runner.close();
     }
@@ -1144,6 +1367,13 @@ describe("code_execution tool", () => {
         { cwd: dir } as ExtensionContext,
       );
       expect(expectFinalDetails(result.details)).toMatchObject({
+        nestedCalls: [
+          {
+            parentToolCallId: "policy-call",
+            registeredName: "search_issues",
+            status: "blocked",
+          },
+        ],
         status: "policy_error",
         stderrTruncated: false,
         stdoutBytes: 0,

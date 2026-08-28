@@ -12,6 +12,7 @@ import type { HostFunctions } from "./runner.ts";
 export type AnyToolDefinition = ToolDefinition<TSchema, any, any>;
 
 export const MAX_RECOVERED_TOOL_OUTPUT_BYTES = 5 * 1024 * 1024;
+export const MAX_NESTED_TOOL_PREVIEW_BYTES = 4 * 1024;
 
 export interface NestedToolCallIdentity {
   childToolCallId: string;
@@ -24,6 +25,7 @@ export interface NestedToolCall extends NestedToolCallIdentity {
   cwd: string;
   input: Record<string, unknown>;
   signal?: AbortSignal;
+  startedAt: string;
   /** Legacy alias for the registered Pi tool name. */
   toolName: string;
 }
@@ -38,9 +40,44 @@ export type NestedToolCallStatus =
   | "validation_error";
 
 export interface NestedToolCallOutcome extends NestedToolCall {
+  durationMs: number;
   error?: unknown;
+  output?: string;
   result?: unknown;
   status: NestedToolCallStatus;
+}
+
+export interface NestedToolCallPreview {
+  bytes: number;
+  text: string;
+  truncated: boolean;
+}
+
+export interface NestedToolUsage {
+  cacheRead: number;
+  cacheWrite: number;
+  cacheWrite1h?: number;
+  cost: {
+    cacheRead: number;
+    cacheWrite: number;
+    input: number;
+    output: number;
+    total: number;
+  };
+  input: number;
+  output: number;
+  reasoning?: number;
+  totalTokens: number;
+}
+
+export interface NestedToolCallRecord extends NestedToolCallIdentity {
+  durationMs: number;
+  errorPreview?: NestedToolCallPreview;
+  inputPreview: NestedToolCallPreview;
+  resultPreview?: NestedToolCallPreview;
+  startedAt: string;
+  status: NestedToolCallStatus;
+  usage?: NestedToolUsage;
 }
 
 export type NestedToolBeforeHandler = (event: NestedToolCall) => void | Promise<void>;
@@ -61,11 +98,148 @@ export interface PythonToolRegistration extends NestedToolRegistration {
 
 export interface HostFunctionIdentityOptions {
   onCall?: (identity: NestedToolCallIdentity) => void;
+  onOutcome?: (outcome: NestedToolCallOutcome) => void;
   parentToolCallId?: string;
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const utf8Preview = (
+  text: string,
+  maxBytes = MAX_NESTED_TOOL_PREVIEW_BYTES,
+): NestedToolCallPreview => {
+  const bytes = Buffer.from(text, "utf-8");
+  if (bytes.length <= maxBytes) {
+    return { bytes: bytes.length, text, truncated: false };
+  }
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] ?? 0) >= 0x80 && (bytes[end] ?? 0) <= 0xbf) {
+    end -= 1;
+  }
+  return {
+    bytes: bytes.length,
+    text: bytes.subarray(0, end).toString("utf-8"),
+    truncated: true,
+  };
+};
+
+const jsonPreview = (value: unknown): NestedToolCallPreview => {
+  let text: string;
+  try {
+    text = JSON.stringify(value) ?? String(value);
+  } catch (error) {
+    text = `[input could not be serialized: ${error instanceof Error ? error.message : String(error)}]`;
+  }
+  return utf8Preview(text);
+};
+
+const errorPreview = (error: unknown): NestedToolCallPreview =>
+  utf8Preview(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
+
+const finiteNumber = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+const nestedUsage = (result: unknown): NestedToolUsage | undefined => {
+  if (!isObject(result) || !isObject(result.usage) || !isObject(result.usage.cost)) {
+    return undefined;
+  }
+  const usage = result.usage;
+  const cost = usage.cost as Record<string, unknown>;
+  if (
+    !finiteNumber(usage.input) ||
+    !finiteNumber(usage.output) ||
+    !finiteNumber(usage.cacheRead) ||
+    !finiteNumber(usage.cacheWrite) ||
+    !finiteNumber(usage.totalTokens) ||
+    (usage.cacheWrite1h !== undefined && !finiteNumber(usage.cacheWrite1h)) ||
+    (usage.reasoning !== undefined && !finiteNumber(usage.reasoning)) ||
+    !finiteNumber(cost.input) ||
+    !finiteNumber(cost.output) ||
+    !finiteNumber(cost.cacheRead) ||
+    !finiteNumber(cost.cacheWrite) ||
+    !finiteNumber(cost.total)
+  ) {
+    return undefined;
+  }
+  return {
+    cacheRead: usage.cacheRead,
+    cacheWrite: usage.cacheWrite,
+    ...(usage.cacheWrite1h === undefined ? {} : { cacheWrite1h: usage.cacheWrite1h }),
+    cost: {
+      cacheRead: cost.cacheRead,
+      cacheWrite: cost.cacheWrite,
+      input: cost.input,
+      output: cost.output,
+      total: cost.total,
+    },
+    input: usage.input,
+    output: usage.output,
+    ...(usage.reasoning === undefined ? {} : { reasoning: usage.reasoning }),
+    totalTokens: usage.totalTokens,
+  };
+};
+
+export const createNestedToolCallRecord = (
+  outcome: NestedToolCallOutcome,
+): NestedToolCallRecord => {
+  const usage = nestedUsage(outcome.result);
+  return {
+    childToolCallId: outcome.childToolCallId,
+    durationMs: outcome.durationMs,
+    ...(outcome.error === undefined ? {} : { errorPreview: errorPreview(outcome.error) }),
+    inputPreview: jsonPreview(outcome.input),
+    parentToolCallId: outcome.parentToolCallId,
+    pythonName: outcome.pythonName,
+    registeredName: outcome.registeredName,
+    ...(outcome.output === undefined ? {} : { resultPreview: utf8Preview(outcome.output) }),
+    startedAt: outcome.startedAt,
+    status: outcome.status,
+    ...(usage ? { usage } : {}),
+  };
+};
+
+export const aggregateNestedToolUsage = (
+  records: NestedToolCallRecord[],
+): NestedToolUsage | undefined => {
+  const usages = records.flatMap(({ usage }) => (usage ? [usage] : []));
+  if (usages.length === 0) return undefined;
+  const cacheWrite1h = usages.some((usage) => usage.cacheWrite1h !== undefined)
+    ? usages.reduce((total, usage) => total + (usage.cacheWrite1h ?? 0), 0)
+    : undefined;
+  const reasoning = usages.some((usage) => usage.reasoning !== undefined)
+    ? usages.reduce((total, usage) => total + (usage.reasoning ?? 0), 0)
+    : undefined;
+  const total = usages.reduce<NestedToolUsage>(
+    (total, usage) => ({
+      cacheRead: total.cacheRead + usage.cacheRead,
+      cacheWrite: total.cacheWrite + usage.cacheWrite,
+      cost: {
+        cacheRead: total.cost.cacheRead + usage.cost.cacheRead,
+        cacheWrite: total.cost.cacheWrite + usage.cost.cacheWrite,
+        input: total.cost.input + usage.cost.input,
+        output: total.cost.output + usage.cost.output,
+        total: total.cost.total + usage.cost.total,
+      },
+      input: total.input + usage.input,
+      output: total.output + usage.output,
+      totalTokens: total.totalTokens + usage.totalTokens,
+    }),
+    {
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: { cacheRead: 0, cacheWrite: 0, input: 0, output: 0, total: 0 },
+      input: 0,
+      output: 0,
+      totalTokens: 0,
+    },
+  );
+  return {
+    ...total,
+    ...(cacheWrite1h === undefined ? {} : { cacheWrite1h }),
+    ...(reasoning === undefined ? {} : { reasoning }),
+  };
+};
 
 const flattenedContent = (result: { content?: { type: string; text?: string }[] }): string =>
   (result.content ?? [])
@@ -553,6 +727,8 @@ export const createHostFunctions = (
       return [
         pythonName,
         async (input: Record<string, unknown>) => {
+          const started = performance.now();
+          const startedAt = new Date().toISOString();
           const identity: NestedToolCallIdentity = {
             childToolCallId: crypto.randomUUID(),
             parentToolCallId: identityOptions.parentToolCallId ?? "untracked-code-execution",
@@ -565,9 +741,11 @@ export const createHostFunctions = (
             cwd: ctx.cwd,
             input,
             ...(signal ? { signal } : {}),
+            startedAt,
             toolName: registeredName,
           };
           let error: unknown;
+          let output: string | undefined;
           let result: unknown;
           let status: NestedToolCallStatus = "failed";
           let validationFailed = false;
@@ -607,12 +785,12 @@ export const createHostFunctions = (
               definition.execute(identity.childToolCallId, prepared, signal, undefined, ctx),
               signal,
             );
-            const flattened = await flattenToolResult(
+            output = await flattenToolResult(
               result as { content?: { type: string; text?: string }[]; details?: unknown },
               registeredName,
             );
             status = "success";
-            return flattened;
+            return output;
           } catch (cause) {
             error = cause;
             status = validationFailed
@@ -620,12 +798,22 @@ export const createHostFunctions = (
               : lifecycleStatus(cause, signal);
             throw cause;
           } finally {
-            await after?.({
+            const outcome: NestedToolCallOutcome = {
               ...call,
+              durationMs: performance.now() - started,
               ...(error === undefined ? {} : { error }),
+              ...(output === undefined ? {} : { output }),
               ...(result === undefined ? {} : { result }),
               status,
-            });
+            };
+            try {
+              await after?.({ ...outcome });
+            } finally {
+              identityOptions.onOutcome?.({
+                ...outcome,
+                durationMs: performance.now() - started,
+              });
+            }
           }
         },
       ];

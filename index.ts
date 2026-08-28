@@ -31,9 +31,11 @@ import {
   truncateOutput,
 } from "./core.ts";
 import {
+  aggregateNestedToolUsage,
   CODE_EXECUTION_COLLECT_TOOLS_EVENT,
   createBridgedRegistrations,
   createHostFunctions,
+  createNestedToolCallRecord,
   createPythonRegistrations,
   createToolCollection,
   MAX_RECOVERED_TOOL_OUTPUT_BYTES,
@@ -41,7 +43,9 @@ import {
 } from "./host.ts";
 import type {
   NestedToolCallIdentity,
+  NestedToolCallOutcome,
   NestedToolCallPreflight,
+  NestedToolCallRecord as HostNestedToolCallRecord,
   NestedToolRegistrationInput,
 } from "./host.ts";
 import {
@@ -197,7 +201,7 @@ export type CodeExecutionInput = Static<typeof parameters>;
 export type CodeExecutionOutputInput = Static<typeof outputParameters>;
 export type CodeExecutionSourceInput = Static<typeof sourceParameters>;
 
-export type NestedToolCallRecord = NestedToolCallIdentity;
+export type NestedToolCallRecord = HostNestedToolCallRecord;
 
 export interface CodeExecutionFinalDetails {
   durationMs: number;
@@ -358,6 +362,47 @@ Saved output
 - Pass an \`outputRef\` unchanged to \`code_execution_output\`; use its continuation offset to recover long output without rerunning side effects.
 
 Environment: runs with your full privileges in the session working directory (relative paths resolve there) with network access, as a fresh process each call with no state persisting between runs. Default deadline is 30 seconds (maximum 300), covering dependency installation and tool calls.`;
+
+interface NestedToolCallTracker {
+  onCall: (identity: NestedToolCallIdentity) => void;
+  onOutcome: (outcome: NestedToolCallOutcome) => void;
+  records: () => NestedToolCallRecord[];
+  waitForSettled: () => Promise<void>;
+}
+
+const createNestedToolCallTracker = (): NestedToolCallTracker => {
+  const order: string[] = [];
+  const records = new Map<string, NestedToolCallRecord>();
+  const waiters = new Set<() => void>();
+  let pending = 0;
+  const settle = (): void => {
+    if (pending !== 0) return;
+    for (const resolve of waiters) resolve();
+    waiters.clear();
+  };
+  return {
+    onCall: ({ childToolCallId }) => {
+      order.push(childToolCallId);
+      pending += 1;
+    },
+    onOutcome: (outcome) => {
+      if (records.has(outcome.childToolCallId)) return;
+      records.set(outcome.childToolCallId, createNestedToolCallRecord(outcome));
+      pending = Math.max(0, pending - 1);
+      settle();
+    },
+    records: () => order.flatMap((id) => {
+      const record = records.get(id);
+      return record ? [record] : [];
+    }),
+    waitForSettled: () =>
+      pending === 0
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            waiters.add(resolve);
+          }),
+  };
+};
 
 const finalDetails = (
   result: RunResult,
@@ -556,7 +601,7 @@ export const createCodeExecutionTool = (
     }
     const sourceRef = { ...codeSourceReference(code, toolCallId), artifactId };
     let outputRef: OutputArtifactReference | undefined;
-    const nestedCalls: NestedToolCallRecord[] = [];
+    const nestedCallTracker = createNestedToolCallTracker();
     let streamedStdout = "";
     let streamedStderr = "";
     const timeoutSecs = input.timeout ?? DEFAULT_TIMEOUT_SECS;
@@ -578,7 +623,8 @@ export const createCodeExecutionTool = (
       code,
       (runSignal) =>
         createHostFunctions(activeRegistrations, ctx, runSignal, preflight, {
-          onCall: (identity) => nestedCalls.push(identity),
+          onCall: nestedCallTracker.onCall,
+          onOutcome: nestedCallTracker.onOutcome,
           parentToolCallId: toolCallId,
         }),
       ({ stream, text }) => {
@@ -603,10 +649,14 @@ export const createCodeExecutionTool = (
         toolSignatures,
       },
     );
+    await nestedCallTracker.waitForSettled();
+    const nestedCalls = nestedCallTracker.records();
+    const nestedUsage = aggregateNestedToolUsage(nestedCalls);
     const output = finalOutput(result, outputRef);
     return {
       content: [{ text: output, type: "text" }],
       details: finalDetails(result, sourceRef, nestedCalls, outputRef),
+      ...(nestedUsage ? { usage: nestedUsage } : {}),
     };
   },
   executionMode: "sequential",
