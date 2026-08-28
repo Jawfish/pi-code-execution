@@ -318,6 +318,7 @@ export const createCodeExecutionTool = (
       details: { artifactId, output },
     };
   },
+  executionMode: "sequential",
   label: "Code Execution",
   name: "code_execution",
   parameters,

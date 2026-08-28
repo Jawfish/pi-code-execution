@@ -78,6 +78,7 @@ describe("code_execution tool", () => {
   test("advertises CPython and optional tool guidance", () => {
     const runner = new SandboxRunner();
     const tool = createCodeExecutionTool(runner);
+    expect(tool.executionMode).toBe("sequential");
     expect(tool.description).toContain("Trusted Pi extensions can opt tools");
     expect(tool.description).toContain("empty when no extension has exposed tools");
     // Filesystem and shell work is done with the standard library instead.
